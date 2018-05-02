@@ -11,6 +11,7 @@ source:
   url: https://github.com/luispedro/ngless/archive/v{{ version }}.tar.gz
   md5: {{ md5 }}
   patches:
+   - use_lts_9_21.patch
    - wget-no-check-certificat.patch
 
 build:
