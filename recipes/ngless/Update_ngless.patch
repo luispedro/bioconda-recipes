@@ -1,24 +1,3 @@
-diff --git a/.gitignore b/.gitignore
-index 541eb9b..de2ad74 100644
---- a/.gitignore
-+++ b/.gitignore
-@@ -8,6 +8,7 @@
- /bwa-0.7.15/
- /megahit-1.1.1/
- /Prodigal-2.6.3/
-+/minimap2-2.9/
- /*.tar.bz2
- /*.tar.gz
- 
-diff --git a/.travis.yml b/.travis.yml
-index ea67c66..f2b0aea 100644
---- a/.travis.yml
-+++ b/.travis.yml
-@@ -45,3 +45,4 @@ script:
-   - mkdir prefix-test
-   - make install prefix=${PWD}/prefix-test
-   - PATH=${PWD}/prefix-test/bin:$PATH ./run-tests.sh
-+  - ./run-benchmarks.sh
 diff --git a/ChangeLog b/ChangeLog
 index 4424fd1..04d834a 100644
 --- a/ChangeLog
