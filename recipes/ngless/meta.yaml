@@ -8,7 +8,7 @@ package:
 
 source:
   fn: {{ version }}.tar.gz
-  url: https://github.com/luispedro/ngless/archive/v{{ version }}.tar.gz
+  url: https://github.com/BigDataBiology/ngless/archive/v{{ version }}.tar.gz
   md5: {{ md5 }}
   patches:
    - Update_ngless.patch
