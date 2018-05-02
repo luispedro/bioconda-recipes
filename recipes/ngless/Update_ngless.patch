@@ -1,4 +1,95 @@
-diff --git a/Execs/Main.hs b/Execs/Main.hs
+diff --git ChangeLog ChangeLog
+index 4424fd1..04d834a 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,14 @@
++Version 0.7.1+
++	* Add minimap2 support as alternative mapper
++	* Faster collect()
++	* Fix writing of multiple compressed files to uncompressed format
++	* Add `n_to_zero_quality` method for short reads
++	* Add </> operator for path manipulation
++	* Fix bug in select (corner case where sequences would be missing from
++	output)
++	* Add non-ATCG fraction field to FastQ statistics
++	* Add reference argument to count()
++
+ Version 0.7.1 2018-03-17 by luispedro
+ 	* Fix memory leak in count()
+ 	* Fix when-true flag usage with external modules
+diff --git Execs/Bench.hs Execs/Bench.hs
+index 2e30aee..354fc94 100644
+--- a/Execs/Bench.hs
++++ b/Execs/Bench.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2016
++{- Copyright 2016-2018
+  - Licence: MIT -}
+ import Criterion.Main
+ 
+@@ -8,7 +8,7 @@ import qualified Data.Conduit.List as CL
+ import qualified Data.Conduit.Binary as CB
+ import qualified Data.Conduit as C
+ import qualified Data.Text as T
+-import           Data.Conduit ((=$=), ($$))
++import           Data.Conduit ((.|), (=$=), ($$))
+ import           Control.DeepSeq (NFData)
+ 
+ import Control.Monad.Trans.Resource (runResourceT)
+@@ -18,13 +18,14 @@ import NGLess (NGLessIO, testNGLessIO)
+ 
+ import Interpretation.Count (performCount, MMMethod(..), loadFunctionalMap, CountOpts(..), annotationRule, AnnotationIntersectionMode(..), Annotator(..), NMode(..))
+ import Interpretation.Substrim (substrim)
++import StandardModules.Parallel (pasteCounts)
+ import Interpret (interpret)
+ import FileOrStream (FileOrStream(..))
+ import Parse (parsengless)
+ import Language (Script(..))
+ import Data.Sam (readSamLine, readSamGroupsC, samStatsC)
+ import Data.FastQ (statsFromFastQ, FastQEncoding(..), ShortRead(..), fqDecodeVector)
+-import Utils.Conduit (linesC, ByteLine(..))
++import Utils.Conduit (linesC, ByteLine(..), conduitPossiblyCompressedFile)
+ import Transform (transform)
+ import NGLess.NGLEnvironment (setupTestEnvironment)
+ 
+@@ -85,22 +86,32 @@ main = setupTestEnvironment >> defaultMain [
+         [ bench "sample" $ nfNGLessIO (CB.sourceFile "test_samples/sample.sam" =$= linesC $$ samStatsC)
+         ]
+     ,bgroup "fastq"
+-        [ bench "fastqStats" $ nfNGLessIO (statsFromFastQ "test_samples/sample.fq.gz" SangerEncoding)
++        [ bench "fastqStats" $ nfNGLessIO (C.runConduitRes (conduitPossiblyCompressedFile "test_samples/sample.fq.gz" .| linesC .| count))
+         , bench "preprocess" $ nfNGLessScript                          "p = fastq('test_samples/sample.fq.gz')\npreprocess(p) using |r|:\n  r = substrim(r, min_quality=26)\n  if len(r) < 45:\n    discard"
+         , bench "preprocess-transformed" $ nfNGLessScriptWithTransform "p = fastq('test_samples/sample.fq.gz')\npreprocess(p) using |r|:\n  r = substrim(r, min_quality=26)\n  if len(r) < 45:\n    discard"
+         , bench "preprocess-pair" $ nfNGLessScript
+                 "p = paired('test_samples/sample.fq.gz', 'test_samples/sample.fq.gz')\npreprocess(p) using |r|:\n  r = substrim(r, min_quality=26)\n"
++        , bench "preprocess-pair-transformed" $ nfNGLessScriptWithTransform
++                "p = paired('test_samples/sample.fq.gz', 'test_samples/sample.fq.gz')\npreprocess(p) using |r|:\n  r = substrim(r, min_quality=26)\n"
++        , bench "preprocess-pair-nop" $ nfNGLessScriptWithTransform
++                "p = paired('test_samples/sample.fq.gz', 'test_samples/sample.fq.gz')\npreprocess(p) using |r|:\n  r = r\n"
+         , bench "substrim" $ nf (substrim 30) exampleSR
+         ]
+     ,bgroup "parse-sam"
+         [ bench "readSamLine" $ nfRIO (CB.sourceFile "test_samples/sample.sam" =$= CB.lines =$= CL.map readSamLine $$ countRights)
+-        , bench "samGroups" $ nfNGLessIO (CB.sourceFile "test_samples/sample.sam" =$= linesC =$= readSamGroupsC $$ count)
++        , bench "samGroups" $ nfNGLessIO (C.runConduitRes (CB.sourceFile "test_samples/sample.sam" .| linesC .| readSamGroupsC .| count))
+         ]
+     ,bgroup "count"
+-        [ bench "load-map"      $ nfNGLessIO (loadFunctionalMap "test_samples/functional.map" ["ko", "cog"])
++        [ bench "load-map"      $ nfNGLessIO (loadFunctionalMap "test_samples/functional.map" ["KEGG_ko", "eggNOG_OG"])
+         , bench "annotate-seqname" . nfNGLessIO $ performCount (File "test_samples/sample.sam") "testing" [SeqNameAnnotator Nothing] basicCountOpts
+         , bench "annotate-functionalmap" . nfNGLessIO $ do
+-                    amap <- loadFunctionalMap "test_samples/functional.map" ["ko", "cog"]
++                    amap <- loadFunctionalMap "test_samples/functional.map" ["KEGG_ko", "eggNOG_OG"]
+                     performCount (File "test_samples/sample.sam") "testing" amap basicCountOpts
+         ]
++    ,bgroup "parallel"
++        [ bench "paste-sparse"   $ nfNGLessIO (pasteCounts [] False ["sample" | _ <- [(0 :: Int)..127]]
++                                                                ["test_samples/merge/sp_sample_"++show i | i <- [(0 :: Int)..127]])
++        , bench "paste-dense"    $ nfNGLessIO (pasteCounts [] True ["sample" | _ <- [(0 :: Int)..127]]
++                                                                ["test_samples/merge/sample_"++show i | i <- [(0 :: Int)..127]])
++        ]
+     ]
+diff --git Execs/Main.hs Execs/Main.hs
 index f3b7793..2c747e3 100644
 --- a/Execs/Main.hs
 +++ b/Execs/Main.hs
@@ -36,7 +127,7 @@ index f3b7793..2c747e3 100644
  
  modeExec :: NGLessMode -> IO ()
  modeExec opts@DefaultMode{} = do
-diff --git a/Makefile b/Makefile
+diff --git Makefile Makefile
 index 9d3cc19..0f943b2 100644
 --- a/Makefile
 +++ b/Makefile
@@ -103,7 +194,7 @@ index 9d3cc19..0f943b2 100644
  # We cannot depend on $(HTML_LIBS_DIR) as wget sets the mtime in the past
  # and it would cause the download to happen at every make run
  $(HTML_LIBS_DIR)/%.js:
-diff --git a/NGLess/BuiltinFunctions.hs b/NGLess/BuiltinFunctions.hs
+diff --git NGLess/BuiltinFunctions.hs NGLess/BuiltinFunctions.hs
 index 4ecee0a..4f5c8e7 100644
 --- a/NGLess/BuiltinFunctions.hs
 +++ b/NGLess/BuiltinFunctions.hs
@@ -123,7 +214,7 @@ index 4ecee0a..4f5c8e7 100644
      ]
  
  filterArgs =
-diff --git a/NGLess/BuiltinModules/AsReads.hs b/NGLess/BuiltinModules/AsReads.hs
+diff --git NGLess/BuiltinModules/AsReads.hs NGLess/BuiltinModules/AsReads.hs
 index 4f70622..0bff1b7 100644
 --- a/NGLess/BuiltinModules/AsReads.hs
 +++ b/NGLess/BuiltinModules/AsReads.hs
@@ -217,7 +308,7 @@ index 4f70622..0bff1b7 100644
  
  
  as_reads_Function = Function
-diff --git a/NGLess/BuiltinModules/QCStats.hs b/NGLess/BuiltinModules/QCStats.hs
+diff --git NGLess/BuiltinModules/QCStats.hs NGLess/BuiltinModules/QCStats.hs
 index a6f0ddf..08efb90 100644
 --- a/NGLess/BuiltinModules/QCStats.hs
 +++ b/NGLess/BuiltinModules/QCStats.hs
@@ -237,7 +328,7 @@ index a6f0ddf..08efb90 100644
      }
  
  loadModule :: T.Text -> NGLessIO Module
-diff --git a/NGLess/Citations.hs b/NGLess/Citations.hs
+diff --git NGLess/Citations.hs NGLess/Citations.hs
 index 607ce26..fc2f274 100644
 --- a/NGLess/Citations.hs
 +++ b/NGLess/Citations.hs
@@ -263,7 +354,7 @@ index 607ce26..fc2f274 100644
              _ -> Nothing
 -    in modCits ++ useCits
 +    in (S.toList . S.fromList) (modCits ++ useCits)
-diff --git a/NGLess/Data/FastQ.hs b/NGLess/Data/FastQ.hs
+diff --git NGLess/Data/FastQ.hs NGLess/Data/FastQ.hs
 index 92ac7ca..802b163 100644
 --- a/NGLess/Data/FastQ.hs
 +++ b/NGLess/Data/FastQ.hs
@@ -506,7 +597,7 @@ index 92ac7ca..802b163 100644
  
  
  qualityPercentiles :: FQStatistics -> [(Int, Int, Int, Int)]
-diff --git a/NGLess/Data/Sam.hs b/NGLess/Data/Sam.hs
+diff --git NGLess/Data/Sam.hs NGLess/Data/Sam.hs
 index 76ed4b0..ea0c154 100644
 --- a/NGLess/Data/Sam.hs
 +++ b/NGLess/Data/Sam.hs
@@ -613,7 +704,7 @@ index 76ed4b0..ea0c154 100644
 -            go (CI.NeedInput x y) = CI.NeedInput (go . x) (go . y)
 -         in go (c0 CI.Done)
 -
-diff --git a/NGLess/Dependencies/Embedded.hs b/NGLess/Dependencies/Embedded.hs
+diff --git NGLess/Dependencies/Embedded.hs NGLess/Dependencies/Embedded.hs
 index 481949a..cdb8b92 100644
 --- a/NGLess/Dependencies/Embedded.hs
 +++ b/NGLess/Dependencies/Embedded.hs
@@ -651,7 +742,7 @@ index 481949a..cdb8b92 100644
 +    B.unsafePackCStringLen (c_get_minimap2_data, convert c_get_minimap2_len)
 +
 +
-diff --git a/NGLess/Dependencies/embedded.c b/NGLess/Dependencies/embedded.c
+diff --git NGLess/Dependencies/embedded.c NGLess/Dependencies/embedded.c
 index 49209cf..9c036d8 100644
 --- a/NGLess/Dependencies/embedded.c
 +++ b/NGLess/Dependencies/embedded.c
@@ -683,7 +774,7 @@ index 49209cf..9c036d8 100644
 +unsigned int get_minimap2_len() { return 0; }
 +
  #endif
-diff --git a/NGLess/FileManagement.hs b/NGLess/FileManagement.hs
+diff --git NGLess/FileManagement.hs NGLess/FileManagement.hs
 index ff549b0..3e8246e 100644
 --- a/NGLess/FileManagement.hs
 +++ b/NGLess/FileManagement.hs
@@ -715,7 +806,7 @@ index ff549b0..3e8246e 100644
  megahitBin :: NGLessIO FilePath
  megahitBin = liftIO (lookupEnv "NGLESS_MEGAHIT_BIN") >>= \case
      Just bin -> checkExecutable "NGLESS_MEGAHIT_BIN" bin
-diff --git a/NGLess/FileOrStream.hs b/NGLess/FileOrStream.hs
+diff --git NGLess/FileOrStream.hs NGLess/FileOrStream.hs
 index d9a3b9c..affe9b6 100644
 --- a/NGLess/FileOrStream.hs
 +++ b/NGLess/FileOrStream.hs
@@ -730,7 +821,7 @@ index d9a3b9c..affe9b6 100644
 +asSamStream (File fname) = (fname, samBamConduit fname =$= linesC)
  asSamStream (Stream fname istream) = (fname, istream)
  
-diff --git a/NGLess/Interpret.hs b/NGLess/Interpret.hs
+diff --git NGLess/Interpret.hs NGLess/Interpret.hs
 index a78d80f..aff91e5 100644
 --- a/NGLess/Interpret.hs
 +++ b/NGLess/Interpret.hs
@@ -1020,7 +1111,7 @@ index a78d80f..aff91e5 100644
          a' <- asDouble a
          b' <- asDouble b
          return . NGOBool $ cmp op a' b'
-diff --git a/NGLess/Interpretation/Count.hs b/NGLess/Interpretation/Count.hs
+diff --git NGLess/Interpretation/Count.hs NGLess/Interpretation/Count.hs
 index 9627b09..3e8a289 100644
 --- a/NGLess/Interpretation/Count.hs
 +++ b/NGLess/Interpretation/Count.hs
@@ -1262,7 +1353,7 @@ index 9627b09..3e8a289 100644
  
          gffSize :: GffLine -> Int
          gffSize g = (gffEnd g - gffStart g) + 1 -- gff format is inclusive at both ends!
-diff --git a/NGLess/Interpretation/FastQ.hs b/NGLess/Interpretation/FastQ.hs
+diff --git NGLess/Interpretation/FastQ.hs NGLess/Interpretation/FastQ.hs
 index e84ee0e..1b0b34a 100644
 --- a/NGLess/Interpretation/FastQ.hs
 +++ b/NGLess/Interpretation/FastQ.hs
@@ -1344,7 +1435,7 @@ index e84ee0e..1b0b34a 100644
 +                                                                                                                                then 0
 +                                                                                                                                else rQ VS.! ix)
  executeShortReadsMethod (MethodName other) _ _ _ = throwShouldNotOccur ("Unknown short read method: " ++ show other)
-diff --git a/NGLess/Interpretation/Map.hs b/NGLess/Interpretation/Map.hs
+diff --git NGLess/Interpretation/Map.hs NGLess/Interpretation/Map.hs
 index 619b849..5d77a1e 100644
 --- a/NGLess/Interpretation/Map.hs
 +++ b/NGLess/Interpretation/Map.hs
@@ -1404,7 +1495,7 @@ index 619b849..5d77a1e 100644
      countfp <- makeNGLTempFile samfp "sam_stats_" ".stats" $ \hout ->
          liftIO . hPutStr hout . concat $
              [     "\t",  T.unpack name, "\n"
-diff --git a/NGLess/Interpretation/Select.hs b/NGLess/Interpretation/Select.hs
+diff --git NGLess/Interpretation/Select.hs NGLess/Interpretation/Select.hs
 index 7741ad7..4c08bfc 100644
 --- a/NGLess/Interpretation/Select.hs
 +++ b/NGLess/Interpretation/Select.hs
@@ -1468,7 +1559,7 @@ index 7741ad7..4c08bfc 100644
                  .| streamedSamStats lno ("select_"++T.unpack name) ("select.lno"++show lno)
                  .| CL.map (map snd)
                  .| CL.concat
-diff --git a/NGLess/Interpretation/Substrim.hs b/NGLess/Interpretation/Substrim.hs
+diff --git NGLess/Interpretation/Substrim.hs NGLess/Interpretation/Substrim.hs
 index ee6968b..d6886a8 100644
 --- a/NGLess/Interpretation/Substrim.hs
 +++ b/NGLess/Interpretation/Substrim.hs
@@ -1529,7 +1620,7 @@ index ee6968b..d6886a8 100644
              | otherwise = trim3p' (n - 1) qs
  
  
-diff --git a/NGLess/Interpretation/Write.hs b/NGLess/Interpretation/Write.hs
+diff --git NGLess/Interpretation/Write.hs NGLess/Interpretation/Write.hs
 index 3988aa9..7a426ec 100644
 --- a/NGLess/Interpretation/Write.hs
 +++ b/NGLess/Interpretation/Write.hs
@@ -1569,7 +1660,7 @@ index 3988aa9..7a426ec 100644
          else case rs of
              ReadSet [] singles ->
                  moveOrCopyCompressFQs singles ofile
-diff --git a/NGLess/JSONScript.hs b/NGLess/JSONScript.hs
+diff --git NGLess/JSONScript.hs NGLess/JSONScript.hs
 index 4e28c54..67c7a0d 100644
 --- a/NGLess/JSONScript.hs
 +++ b/NGLess/JSONScript.hs
@@ -1582,7 +1673,7 @@ index 4e28c54..67c7a0d 100644
  encodeUOp :: UOp -> String
  encodeUOp UOpLen = "len"
  encodeUOp UOpMinus = "negate"
-diff --git a/NGLess/Language.hs b/NGLess/Language.hs
+diff --git NGLess/Language.hs NGLess/Language.hs
 index 435062c..6930e0b 100644
 --- a/NGLess/Language.hs
 +++ b/NGLess/Language.hs
@@ -1601,7 +1692,7 @@ index 435062c..6930e0b 100644
      deriving (Eq, Ord, Show)
  
  -- | index expression encodes what is inside an index variable
-diff --git a/NGLess/Modules.hs b/NGLess/Modules.hs
+diff --git NGLess/Modules.hs NGLess/Modules.hs
 index 3a91564..9838306 100644
 --- a/NGLess/Modules.hs
 +++ b/NGLess/Modules.hs
@@ -1613,7 +1704,7 @@ index 3a91564..9838306 100644
              deriving (Eq, Show)
  
  -- | Basic information about argument to a function
-diff --git a/NGLess/NGLess/NGError.hs b/NGLess/NGLess/NGError.hs
+diff --git NGLess/NGLess/NGError.hs NGLess/NGLess/NGError.hs
 index a425cd0..32eafb1 100644
 --- a/NGLess/NGLess/NGError.hs
 +++ b/NGLess/NGLess/NGError.hs
@@ -1685,7 +1776,7 @@ index a425cd0..32eafb1 100644
  
  -- | Internal bug: user is requested to submit a bug report
  throwShouldNotOccur :: (MonadError NGError m) => String -> m a
-diff --git a/NGLess/Output.hs b/NGLess/Output.hs
+diff --git NGLess/Output.hs NGLess/Output.hs
 index 4448aa9..271c2b3 100644
 --- a/NGLess/Output.hs
 +++ b/NGLess/Output.hs
@@ -1722,7 +1813,7 @@ index 4448aa9..271c2b3 100644
  
          msHeaders                      = [ "inputFile",  "lineNumber",  "reference",            "total",            "aligned",            "unique"]
          encodeMapStats MappingInfo{..} = [mi_inputFile,   show mi_lno, mi_reference, show mi_totalReads, show mi_totalAligned, show mi_totalUnique]
-diff --git a/NGLess/Parse.hs b/NGLess/Parse.hs
+diff --git NGLess/Parse.hs NGLess/Parse.hs
 index cc8f5fb..574bcea 100644
 --- a/NGLess/Parse.hs
 +++ b/NGLess/Parse.hs
@@ -1741,7 +1832,7 @@ index cc8f5fb..574bcea 100644
  
  
  sliceList :: Int -> Int -> [a] -> [a]
-diff --git a/NGLess/StandardModules/Mappers/Bwa.hs b/NGLess/StandardModules/Mappers/Bwa.hs
+diff --git NGLess/StandardModules/Mappers/Bwa.hs NGLess/StandardModules/Mappers/Bwa.hs
 index 24b1212..eb49cc4 100644
 --- a/NGLess/StandardModules/Mappers/Bwa.hs
 +++ b/NGLess/StandardModules/Mappers/Bwa.hs
@@ -1821,7 +1912,7 @@ index 24b1212..eb49cc4 100644
              return out
          ExitFailure code ->
              throwSystemError $ concat ["Failed mapping\n",
-diff --git a/NGLess/StandardModules/Mappers/Minimap2.hs b/NGLess/StandardModules/Mappers/Minimap2.hs
+diff --git NGLess/StandardModules/Mappers/Minimap2.hs NGLess/StandardModules/Mappers/Minimap2.hs
 new file mode 100644
 index 0000000..e1957be
 --- /dev/null
@@ -1954,7 +2045,7 @@ index 0000000..e1957be
 +                                        .| CB.sinkHandle hout
 +                        samSorter ((CB.sourceFile partial .| linesC .| CL.map unwrapByteLine):partials)
 +
-diff --git a/NGLess/StandardModules/Mappers/Soap.hs b/NGLess/StandardModules/Mappers/Soap.hs
+diff --git NGLess/StandardModules/Mappers/Soap.hs NGLess/StandardModules/Mappers/Soap.hs
 index a73b402..c6af48d 100644
 --- a/NGLess/StandardModules/Mappers/Soap.hs
 +++ b/NGLess/StandardModules/Mappers/Soap.hs
@@ -2000,7 +2091,7 @@ index a73b402..c6af48d 100644
      where
          -- asSamHeader :: C.Conduit ByteLine IO B.ByteString
          asSamHeader = awaitJust $ \(ByteLine line) -> case readId line of
-diff --git a/NGLess/StandardModules/Minimap2.hs b/NGLess/StandardModules/Minimap2.hs
+diff --git NGLess/StandardModules/Minimap2.hs NGLess/StandardModules/Minimap2.hs
 new file mode 100644
 index 0000000..e1a70a1
 --- /dev/null
@@ -2035,7 +2126,7 @@ index 0000000..e1a70a1
 +        citation = T.concat
 +                    ["Li.  Minimap2: pairwise alignment for nucleotide sequences"
 +                    ," in arXiv (2018) https://arxiv.org/abs/1708.01492"]
-diff --git a/NGLess/StandardModules/Mocat.hs b/NGLess/StandardModules/Mocat.hs
+diff --git NGLess/StandardModules/Mocat.hs NGLess/StandardModules/Mocat.hs
 index 0bb9001..9fbc4af 100644
 --- a/NGLess/StandardModules/Mocat.hs
 +++ b/NGLess/StandardModules/Mocat.hs
@@ -2048,7 +2139,7 @@ index 0bb9001..9fbc4af 100644
                  .| CL.mapM convertToGff
                  .| C.unlinesAscii
                  .| C.sinkHandle hout
-diff --git a/NGLess/StandardModules/NGLStdlib.hs b/NGLess/StandardModules/NGLStdlib.hs
+diff --git NGLess/StandardModules/NGLStdlib.hs NGLess/StandardModules/NGLStdlib.hs
 index 87b35a1..e7e92bc 100644
 --- a/NGLess/StandardModules/NGLStdlib.hs
 +++ b/NGLess/StandardModules/NGLStdlib.hs
@@ -2067,7 +2158,7 @@ index 87b35a1..e7e92bc 100644
 +        loadModules1 (ModInfo "minimap2" version) = Minimap2.loadModule version
          loadModules1 minfo = Ext.loadModule minfo
  
-diff --git a/NGLess/StandardModules/Parallel.hs b/NGLess/StandardModules/Parallel.hs
+diff --git NGLess/StandardModules/Parallel.hs NGLess/StandardModules/Parallel.hs
 index c0d59c2..d6346e7 100644
 --- a/NGLess/StandardModules/Parallel.hs
 +++ b/NGLess/StandardModules/Parallel.hs
@@ -2208,7 +2299,7 @@ index c0d59c2..d6346e7 100644
  
  pasteCounts :: [T.Text] -> Bool -> [T.Text] -> [FilePath] -> NGLessIO FilePath
  pasteCounts comments matchingRows headers inputs
-diff --git a/NGLess/Tokens.hs b/NGLess/Tokens.hs
+diff --git NGLess/Tokens.hs NGLess/Tokens.hs
 index 5e8b3a0..cc8abbb 100644
 --- a/NGLess/Tokens.hs
 +++ b/NGLess/Tokens.hs
@@ -2268,7 +2359,7 @@ index 5e8b3a0..cc8abbb 100644
                      , ("<=", BOpLTE)
                      , ("<", BOpLT)
                      , (">=", BOpGTE)
-diff --git a/NGLess/Types.hs b/NGLess/Types.hs
+diff --git NGLess/Types.hs NGLess/Types.hs
 index c9fb47d..6c550cf 100644
 --- a/NGLess/Types.hs
 +++ b/NGLess/Types.hs
@@ -2280,7 +2371,7 @@ index c9fb47d..6c550cf 100644
  
  softCheck :: NGLType -> Expression -> TypeMSt (Maybe NGLType)
  softCheck expected expr = do
-diff --git a/NGLess/Utils/Conduit.hs b/NGLess/Utils/Conduit.hs
+diff --git NGLess/Utils/Conduit.hs NGLess/Utils/Conduit.hs
 index c9c6d06..98f7c04 100644
 --- a/NGLess/Utils/Conduit.hs
 +++ b/NGLess/Utils/Conduit.hs
@@ -2347,7 +2438,7 @@ index c9c6d06..98f7c04 100644
  
  zipSource2 a b = C.getZipSource ((,) <$> C.ZipSource a <*> C.ZipSource b)
  
-diff --git a/NGLess/Validation.hs b/NGLess/Validation.hs
+diff --git NGLess/Validation.hs NGLess/Validation.hs
 index aadf317..d8640bd 100644
 --- a/NGLess/Validation.hs
 +++ b/NGLess/Validation.hs
@@ -2399,7 +2490,7 @@ index aadf317..d8640bd 100644
          minVersionMethod :: MethodInfo -> Maybe (Int, Int)
          minVersionMethod minfo =
              asum $ flip map (methodChecks minfo) $ \case
-diff --git a/NGLess/Version.hs b/NGLess/Version.hs
+diff --git NGLess/Version.hs NGLess/Version.hs
 index fe6ff0f..2b87fcf 100644
 --- a/NGLess/Version.hs
 +++ b/NGLess/Version.hs
@@ -2412,7 +2503,7 @@ index fe6ff0f..2b87fcf 100644
  
  gitHashStr :: String
  gitHashStr = $(gitHash)
-diff --git a/README.md b/README.md
+diff --git README.md README.md
 index 008b9ab..8c8821c 100644
 --- a/README.md
 +++ b/README.md
@@ -2444,7 +2535,7 @@ index 008b9ab..8c8821c 100644
  
  This download bundles bwa, samtools and megahit (also statically linked).
  
-diff --git a/Tests-Src/Tests.hs b/Tests-Src/Tests.hs
+diff --git Tests-Src/Tests.hs Tests-Src/Tests.hs
 index ce5c47a..0df265a 100644
 --- a/Tests-Src/Tests.hs
 +++ b/Tests-Src/Tests.hs
@@ -2566,7 +2657,7 @@ index ce5c47a..0df265a 100644
      let n' = min n 4
      nuniq @?=  (n' * 54)
  
-diff --git a/Tests-Src/Tests/FastQ.hs b/Tests-Src/Tests/FastQ.hs
+diff --git Tests-Src/Tests/FastQ.hs Tests-Src/Tests/FastQ.hs
 index c13b05a..d3a0a37 100644
 --- a/Tests-Src/Tests/FastQ.hs
 +++ b/Tests-Src/Tests/FastQ.hs
@@ -2668,7 +2759,7 @@ index c13b05a..d3a0a37 100644
 +case_endstrim_quals_one_OK_5 = endstrimPos Endstrim5 (VS.fromList [9,9,10,9]) 10 @?= (2,2)
 +case_endstrim_1 = endstrimPos EndstrimBoth (VS.fromList [9,9,10,9,9,10,9]) 10 @?= (2,4)
  
-diff --git a/Tests-Src/Tests/Utils.hs b/Tests-Src/Tests/Utils.hs
+diff --git Tests-Src/Tests/Utils.hs Tests-Src/Tests/Utils.hs
 index 0467893..ab3585c 100644
 --- a/Tests-Src/Tests/Utils.hs
 +++ b/Tests-Src/Tests/Utils.hs
@@ -2687,7 +2778,7 @@ index 0467893..ab3585c 100644
  
  isError :: Either a b -> Assertion
  isError = isErrorMsg "Error not caught"
-diff --git a/build-scripts/minimap2-static-compile.patch b/build-scripts/minimap2-static-compile.patch
+diff --git build-scripts/minimap2-static-compile.patch build-scripts/minimap2-static-compile.patch
 new file mode 100644
 index 0000000..f27354e
 --- /dev/null
@@ -3000,7 +3091,7 @@ index 0000000..f27354e
 + 		}
 + 		mm_idx_destroy(mi);
 + 	}
-diff --git a/docs/sources/Functions.rst b/docs/sources/Functions.rst
+diff --git docs/sources/Functions.rst docs/sources/Functions.rst
 index 6ec20c9..dccc2b2 100644
 --- a/docs/sources/Functions.rst
 +++ b/docs/sources/Functions.rst
@@ -3013,7 +3104,7 @@ index 6ec20c9..dccc2b2 100644
  
  
  If the features to count are ``['seqname']``, then each read will be assigned
-diff --git a/docs/sources/methods.md b/docs/sources/methods.md
+diff --git docs/sources/methods.md docs/sources/methods.md
 index 0558e63..ededb7c 100644
 --- a/docs/sources/methods.md
 +++ b/docs/sources/methods.md
@@ -3034,7 +3125,7 @@ index 0558e63..ededb7c 100644
  ## Mapped reads
  
  Mapped reads contain several methods. *None of these methods changes its
-diff --git a/docs/sources/tutorial-gut-metagenomics.rst b/docs/sources/tutorial-gut-metagenomics.rst
+diff --git docs/sources/tutorial-gut-metagenomics.rst docs/sources/tutorial-gut-metagenomics.rst
 index b4e3046..e22e092 100644
 --- a/docs/sources/tutorial-gut-metagenomics.rst
 +++ b/docs/sources/tutorial-gut-metagenomics.rst
@@ -3090,7 +3181,7 @@ index b4e3046..e22e092 100644
          read = substrim(read, min_quality=25)
          if len(read) < 45:
              discard
-diff --git a/docs/sources/tutorial-ocean-metagenomics.rst b/docs/sources/tutorial-ocean-metagenomics.rst
+diff --git docs/sources/tutorial-ocean-metagenomics.rst docs/sources/tutorial-ocean-metagenomics.rst
 index 8d26d8f..8a4d428 100644
 --- a/docs/sources/tutorial-ocean-metagenomics.rst
 +++ b/docs/sources/tutorial-ocean-metagenomics.rst
@@ -3125,7 +3216,7 @@ index 8d26d8f..8a4d428 100644
  
  
  Full script
-diff --git a/docs/sources/whatsnew.rst b/docs/sources/whatsnew.rst
+diff --git docs/sources/whatsnew.rst docs/sources/whatsnew.rst
 index db8df5c..cc2a339 100644
 --- a/docs/sources/whatsnew.rst
 +++ b/docs/sources/whatsnew.rst
@@ -3174,7 +3265,7 @@ index db8df5c..cc2a339 100644
  Version 0.7.1
  -------------
  
-diff --git a/package.yaml b/package.yaml
+diff --git package.yaml package.yaml
 index d269ffb..e091f1a 100644
 --- a/package.yaml
 +++ b/package.yaml
@@ -3204,7 +3295,7 @@ index d269ffb..e091f1a 100644
    - vector >=0.11
    - vector-algorithms
    - yaml
-diff --git a/run-benchmarks.sh b/run-benchmarks.sh
+diff --git run-benchmarks.sh run-benchmarks.sh
 new file mode 100755
 index 0000000..eecb423
 --- /dev/null
@@ -3226,7 +3317,7 @@ index 0000000..eecb423
 +    (cd test_samples/merge && python generate.py)
 +fi
 +exec stack bench --benchmark-arguments "--output bench.html"
-diff --git a/stack.yaml b/stack.yaml
+diff --git stack.yaml stack.yaml
 index 285fc37..a4ed298 100644
 --- a/stack.yaml
 +++ b/stack.yaml
@@ -3248,7 +3339,7 @@ index 285fc37..a4ed298 100644
  allow-newer: true
  
  # Override default flag values for local packages and extra-deps
-diff --git a/test_samples/.gitignore b/test_samples/.gitignore
+diff --git test_samples/.gitignore test_samples/.gitignore
 index ecf4dbf..6615403 100644
 --- a/test_samples/.gitignore
 +++ b/test_samples/.gitignore
@@ -3257,11 +3348,11 @@ index ecf4dbf..6615403 100644
  sample.sam
  sample.gtf
 +functional.map
-diff --git a/test_samples/functional.map.gz b/test_samples/functional.map.gz
+diff --git test_samples/functional.map.gz test_samples/functional.map.gz
 new file mode 100644
 index 0000000..87115de
 Binary files /dev/null and b/test_samples/functional.map.gz differ
-diff --git a/test_samples/merge/.gitignore b/test_samples/merge/.gitignore
+diff --git test_samples/merge/.gitignore test_samples/merge/.gitignore
 new file mode 100644
 index 0000000..33bfe7c
 --- /dev/null
@@ -3269,7 +3360,7 @@ index 0000000..33bfe7c
 @@ -0,0 +1,2 @@
 +sample_*
 +sp_sample_*
-diff --git a/test_samples/merge/generate.py b/test_samples/merge/generate.py
+diff --git test_samples/merge/generate.py test_samples/merge/generate.py
 new file mode 100644
 index 0000000..131c45d
 --- /dev/null
@@ -3287,7 +3378,7 @@ index 0000000..131c45d
 +                    output.write("Feature_{}\t{}\n".format(f, random()*1000))
 +                elif not sparse:
 +                    output.write("Feature_{}\t0\n".format(f))
-diff --git a/tests/argv/argv.ngl b/tests/argv/argv.ngl
+diff --git tests/argv/argv.ngl tests/argv/argv.ngl
 index d9eb178..59cd8d7 100644
 --- a/tests/argv/argv.ngl
 +++ b/tests/argv/argv.ngl
@@ -3296,7 +3387,7 @@ index d9eb178..59cd8d7 100644
 +ngless "0.8"
  print(ARGV[0])
  print("\n")
-diff --git a/tests/as-reads-3/as_reads.ngl b/tests/as-reads-3/as_reads.ngl
+diff --git tests/as-reads-3/as_reads.ngl tests/as-reads-3/as_reads.ngl
 index f528e83..05a66a4 100644
 --- a/tests/as-reads-3/as_reads.ngl
 +++ b/tests/as-reads-3/as_reads.ngl
@@ -3306,7 +3397,7 @@ index f528e83..05a66a4 100644
  write(as_reads(samfile('input.sam')),
          ofile='output.fq')
  
-diff --git a/tests/as_reads-bam/as_reads.ngl b/tests/as_reads-bam/as_reads.ngl
+diff --git tests/as_reads-bam/as_reads.ngl tests/as_reads-bam/as_reads.ngl
 index 7cfbce9..9eb9d3c 100644
 --- a/tests/as_reads-bam/as_reads.ngl
 +++ b/tests/as_reads-bam/as_reads.ngl
@@ -3315,7 +3406,7 @@ index 7cfbce9..9eb9d3c 100644
 +ngless '0.8'
  write(as_reads(samfile('input.bam')),
          ofile='output.fq')
-diff --git a/tests/as_reads/as_reads.ngl b/tests/as_reads/as_reads.ngl
+diff --git tests/as_reads/as_reads.ngl tests/as_reads/as_reads.ngl
 index 7e3a8ed..9b7e90b 100644
 --- a/tests/as_reads/as_reads.ngl
 +++ b/tests/as_reads/as_reads.ngl
@@ -3325,7 +3416,7 @@ index 7e3a8ed..9b7e90b 100644
  input = fastq('sample.fq')
  mapped = map(input,reference='sacCer3')
  reads = as_reads(mapped)
-diff --git a/tests/as_reads_encoding/as_reads.ngl b/tests/as_reads_encoding/as_reads.ngl
+diff --git tests/as_reads_encoding/as_reads.ngl tests/as_reads_encoding/as_reads.ngl
 index 8c0d7bd..6e3005c 100644
 --- a/tests/as_reads_encoding/as_reads.ngl
 +++ b/tests/as_reads_encoding/as_reads.ngl
@@ -3335,7 +3426,7 @@ index 8c0d7bd..6e3005c 100644
  input = as_reads(samfile('sanger.encoded.sam'))
  input = preprocess(input, keep_singles=True) using |read|:
      read = substrim(read, min_quality=25)
-diff --git a/tests/as_reads_regression/as_reads.ngl b/tests/as_reads_regression/as_reads.ngl
+diff --git tests/as_reads_regression/as_reads.ngl tests/as_reads_regression/as_reads.ngl
 index 64a0179..0fc342f 100644
 --- a/tests/as_reads_regression/as_reads.ngl
 +++ b/tests/as_reads_regression/as_reads.ngl
@@ -3344,7 +3435,7 @@ index 64a0179..0fc342f 100644
 +ngless "0.8"
  
  write(as_reads(samfile('test.sam')), ofile='output.fq')
-diff --git a/tests/assemble-gp/assemble-gp.ngl b/tests/assemble-gp/assemble-gp.ngl
+diff --git tests/assemble-gp/assemble-gp.ngl tests/assemble-gp/assemble-gp.ngl
 index 4879317..0d6dd33 100644
 --- a/tests/assemble-gp/assemble-gp.ngl
 +++ b/tests/assemble-gp/assemble-gp.ngl
@@ -3354,7 +3445,7 @@ index 4879317..0d6dd33 100644
  
  input = fastq('sample.fq.gz')
  write(orf_find(assemble(input),
-diff --git a/tests/assemble/assemble.ngl b/tests/assemble/assemble.ngl
+diff --git tests/assemble/assemble.ngl tests/assemble/assemble.ngl
 index dc873f6..b0ee1a0 100644
 --- a/tests/assemble/assemble.ngl
 +++ b/tests/assemble/assemble.ngl
@@ -3364,7 +3455,7 @@ index dc873f6..b0ee1a0 100644
  
  input = fastq('sample.fq.gz')
  write(assemble(input), ofile='output.fna')
-diff --git a/tests/grouped/expected.fqstats.tsv b/tests/grouped/expected.fqstats.tsv
+diff --git tests/grouped/expected.fqstats.tsv tests/grouped/expected.fqstats.tsv
 index 235f8b2..f0bb791 100644
 --- a/tests/grouped/expected.fqstats.tsv
 +++ b/tests/grouped/expected.fqstats.tsv
@@ -3389,7 +3480,7 @@ index 235f8b2..f0bb791 100644
  2:maxSeqLen	83
  2:gcContent	0.42921348314606744
 +2:nonATCGFraction	4.4742729306487695e-3
-diff --git a/tests/grouped/grouped.ngl b/tests/grouped/grouped.ngl
+diff --git tests/grouped/grouped.ngl tests/grouped/grouped.ngl
 index cc62c1d..6d7b91f 100644
 --- a/tests/grouped/grouped.ngl
 +++ b/tests/grouped/grouped.ngl
@@ -3399,7 +3490,7 @@ index cc62c1d..6d7b91f 100644
  one = fastq('sample.fq')
  mapped = map(one,reference='sacCer3')
  write(mapped, ofile='one.sam')
-diff --git a/tests/map-minimap2/.gitignore b/tests/map-minimap2/.gitignore
+diff --git tests/map-minimap2/.gitignore tests/map-minimap2/.gitignore
 new file mode 100644
 index 0000000..411c2f1
 --- /dev/null
@@ -3407,7 +3498,7 @@ index 0000000..411c2f1
 @@ -0,0 +1,2 @@
 +ref.4G.fna.idx
 +ref.fna.mm2.idx
-diff --git a/tests/map-minimap2/expected.sam b/tests/map-minimap2/expected.sam
+diff --git tests/map-minimap2/expected.sam tests/map-minimap2/expected.sam
 new file mode 100644
 index 0000000..3ad703c
 --- /dev/null
@@ -3421,7 +3512,7 @@ index 0000000..3ad703c
 +ReadP	0	A	189	38	80M	*	0	0	CTCGAACCTCCAATCTTCGGATCCGAAGTCCGACGCCCCCGCGTCGGATGCGTTGTTACCACTGCTTTTGGTATCATTGA	HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH	NM:i:0	ms:i:160	AS:i:160	nn:i:0	tp:A:P	cm:i:8	s1:i:62	s2:i:0	dv:f:0.0079
 +ReadP	0	A	69	49	80M	*	0	0	TATATATATATTTCTTGTAATTTGTTGGAATACGAGAACATCGTCAATAATATATCGTATGAATTGAACCACACGGCACA	HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH	NM:i:0	ms:i:160	AS:i:160	nn:i:0	tp:A:P	cm:i:9	s1:i:68	s2:i:0	dv:f:0.0070
 +readS	0	C	35	50	80M	*	0	0	TCTTGGGAACCTACAGAACTGGTTATTGGTGTCGTGGAACCTCTTACTGCTTTCAATACACGATTAGTAATCAACTGTTT	HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH	NM:i:0	ms:i:160	AS:i:160	nn:i:0	tp:A:P	cm:i:12	s1:i:69	s2:i:0	dv:f:0.0053
-diff --git a/tests/map-minimap2/map-minimap2.ngl b/tests/map-minimap2/map-minimap2.ngl
+diff --git tests/map-minimap2/map-minimap2.ngl tests/map-minimap2/map-minimap2.ngl
 new file mode 100644
 index 0000000..0abc1d9
 --- /dev/null
@@ -3433,7 +3524,7 @@ index 0000000..0abc1d9
 +input = paired('sample.1.fq', 'sample.2.fq', singles='sample.singles.fq')
 +mapped = map(input, fafile='ref.fna', mapper='minimap2')
 +write(mapped, ofile='output.sam')
-diff --git a/tests/map-minimap2/ref.fna b/tests/map-minimap2/ref.fna
+diff --git tests/map-minimap2/ref.fna tests/map-minimap2/ref.fna
 new file mode 120000
 index 0000000..538d122
 --- /dev/null
@@ -3441,7 +3532,7 @@ index 0000000..538d122
 @@ -0,0 +1 @@
 +../parallel/ref.fna
 \ No newline at end of file
-diff --git a/tests/map-minimap2/sample.1.fq b/tests/map-minimap2/sample.1.fq
+diff --git tests/map-minimap2/sample.1.fq tests/map-minimap2/sample.1.fq
 new file mode 100644
 index 0000000..5c98f9d
 --- /dev/null
@@ -3451,7 +3542,7 @@ index 0000000..5c98f9d
 +TATATATATATTTCTTGTAATTTGTTGGAATACGAGAACATCGTCAATAATATATCGTATGAATTGAACCACACGGCACA
 ++
 +HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH
-diff --git a/tests/map-minimap2/sample.2.fq b/tests/map-minimap2/sample.2.fq
+diff --git tests/map-minimap2/sample.2.fq tests/map-minimap2/sample.2.fq
 new file mode 100644
 index 0000000..765faf9
 --- /dev/null
@@ -3461,7 +3552,7 @@ index 0000000..765faf9
 +CTCGAACCTCCAATCTTCGGATCCGAAGTCCGACGCCCCCGCGTCGGATGCGTTGTTACCACTGCTTTTGGTATCATTGA
 ++
 +HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH
-diff --git a/tests/map-minimap2/sample.singles.fq b/tests/map-minimap2/sample.singles.fq
+diff --git tests/map-minimap2/sample.singles.fq tests/map-minimap2/sample.singles.fq
 new file mode 100644
 index 0000000..fa6bd8c
 --- /dev/null
@@ -3471,7 +3562,7 @@ index 0000000..fa6bd8c
 +TCTTGGGAACCTACAGAACTGGTTATTGGTGTCGTGGAACCTCTTACTGCTTTCAATACACGATTAGTAATCAACTGTTT
 ++
 +HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH
-diff --git a/tests/mapstats/mapstats.ngl b/tests/mapstats/mapstats.ngl
+diff --git tests/mapstats/mapstats.ngl tests/mapstats/mapstats.ngl
 index e7f727d..8466da6 100644
 --- a/tests/mapstats/mapstats.ngl
 +++ b/tests/mapstats/mapstats.ngl
@@ -3481,7 +3572,7 @@ index e7f727d..8466da6 100644
  
  mapped = samfile("input.sam")
  write(mapstats(mapped), ofile="output.txt")
-diff --git a/tests/merge-sams/merge.ngl b/tests/merge-sams/merge.ngl
+diff --git tests/merge-sams/merge.ngl tests/merge-sams/merge.ngl
 index 11f7ed0..14b7010 100644
 --- a/tests/merge-sams/merge.ngl
 +++ b/tests/merge-sams/merge.ngl
@@ -3491,7 +3582,7 @@ index 11f7ed0..14b7010 100644
  
  write(__merge_samfiles(['input1.sam', 'input2.sam']),
        ofile='output.merged.sam')
-diff --git a/tests/mocat_sample_bz2/mocat.ngl b/tests/mocat_sample_bz2/mocat.ngl
+diff --git tests/mocat_sample_bz2/mocat.ngl tests/mocat_sample_bz2/mocat.ngl
 index 95f15bb..17aa7a5 100644
 --- a/tests/mocat_sample_bz2/mocat.ngl
 +++ b/tests/mocat_sample_bz2/mocat.ngl
@@ -3508,7 +3599,7 @@ index 95f15bb..17aa7a5 100644
     read = read[trim:]
     if len(read) < 10:
         discard
-diff --git a/tests/motus/motus.ngl b/tests/motus/motus.ngl
+diff --git tests/motus/motus.ngl tests/motus/motus.ngl
 index bea076d..fc18f5f 100644
 --- a/tests/motus/motus.ngl
 +++ b/tests/motus/motus.ngl
@@ -3518,7 +3609,7 @@ index bea076d..fc18f5f 100644
  import "motus" version "0.1"
  
  input = paired('input.1.fq.gz', 'input.2.fq.gz')
-diff --git a/tests/parallel/ref.fna b/tests/parallel/ref.fna
+diff --git tests/parallel/ref.fna tests/parallel/ref.fna
 index dce382c..36207dd 100644
 --- a/tests/parallel/ref.fna
 +++ b/tests/parallel/ref.fna
@@ -3543,7 +3634,7 @@ index dce382c..36207dd 100644
  AGAAGACATTCAAGAAGTTGGAATGTCACGAGACGAACCAATTAAGCGGATCGATGTGAAGGTCAATGAGCAATTCAAGTTTACAGTAAACTTTGCGACGTCTCAACAATTCGATAAGGTGCTGTACCAAATGTCAAGATTATTATATTTTATTATTATTATAATTGACCCACCGGATAGCAGGAAAAGAGCAGACAAACATTAGGACGGGAGAACTCAGAAAGATTTTTTGACTTTAATTTGGACATTTGTGCTTATTGTAATGTGTTACGGCTCATATTACAGTAATAAAGCTGTCCTGATGTTTAAGAAAAAAAG
  TTTTATAGTTTCATGAGAGGAAGGCAAGTCTAACGGTTAGGGTGCTAGTCCGGAACTCGGGAAACTCAGGTGCAGTTTCTAGCTCTGTTACAAAACTTCCTGCCTGATCAAGGCACACAGGGGATAGGTTCTCTTCAGTTGCCCTTCCCGATTCATCATTCCAAATTCAATTTCTTTCCGATGACGTGTAATCTAGCTTCAGAATCCAGACAATTTCAGCTTTTCAATATTTATTTAATTATTCTTGATCTTTAAATTATTATTCTAATTTATATTATTGGTTCAATAGTAATAATGAAAAGAATAGTAGTTTTACAAAAGTAAAACGGAATGCGTTGTTACCACTGCTT
  TTTTCATGTCGTAATGTATATTTTAATGTAGGAGCTGGTGTAGTAATTTAGAGCAATAAATATCACACAGTGAAAATTTATCACAAACTAAATACAGTAACAAAAGAAAGAAAAGCTTATGTACACATTACTGAGGTCTTCACAATAAATTATAGTGTACAGTTCCATCACAGCGTATTTGTATACAAAGCTGGTAATGTGAACACTGAAAGGAATCTCTTATGTAAGTCTTTAATCTTGATTTAATAAAGTTTATACAGTATCAAATAATATCAAAAGTCTAAAAAACACAATGAGTTTTTATATCATGTTTATAAATTATTGTTTCATATACCATAAAAAAATAAGGTCGGATGCGTTGTTACCACTGCTTAGCGGTCAGCAACGATGAAGGTGCAGATGGATCTGATGAGCCAAGGCTAAGCGTACTGTGTTCGCTGAGGATGGTGCTCCAGCTGCTGCTGCCGCCGAGTAATTCATCTTTGTTGTAACAACCCAATACTCATTCTTNTT
-diff --git a/tests/parse_odd_corners/expression.ngl b/tests/parse_odd_corners/expression.ngl
+diff --git tests/parse_odd_corners/expression.ngl tests/parse_odd_corners/expression.ngl
 index acd34c1..e9df6b0 100644
 --- a/tests/parse_odd_corners/expression.ngl
 +++ b/tests/parse_odd_corners/expression.ngl
@@ -3558,7 +3649,7 @@ index acd34c1..e9df6b0 100644
  
  line0 = readlines('input.txt')[0]
  print(line0)
-diff --git a/tests/paste/paste.ngl b/tests/paste/paste.ngl
+diff --git tests/paste/paste.ngl tests/paste/paste.ngl
 index f3ed343..26e947b 100644
 --- a/tests/paste/paste.ngl
 +++ b/tests/paste/paste.ngl
@@ -3568,7 +3659,7 @@ index f3ed343..26e947b 100644
  import "parallel" version "0.6"
  
  
-diff --git a/tests/paste_regression/expected.txt b/tests/paste_regression/expected.txt
+diff --git tests/paste_regression/expected.txt tests/paste_regression/expected.txt
 new file mode 100644
 index 0000000..b129bf4
 --- /dev/null
@@ -3623,15 +3714,15 @@ index 0000000..b129bf4
 +5:maxSeqLen	0	141
 +5:gcContent	0	0.4959799727504751
 +5:nonATCGFraction	0	0.0
-diff --git a/tests/paste_regression/partial.SAMEA2581908.tsv.gz b/tests/paste_regression/partial.SAMEA2581908.tsv.gz
+diff --git tests/paste_regression/partial.SAMEA2581908.tsv.gz tests/paste_regression/partial.SAMEA2581908.tsv.gz
 new file mode 100644
 index 0000000..c15f42d
 Binary files /dev/null and b/tests/paste_regression/partial.SAMEA2581908.tsv.gz differ
-diff --git a/tests/paste_regression/partial.SRX1670084.tsv.gz b/tests/paste_regression/partial.SRX1670084.tsv.gz
+diff --git tests/paste_regression/partial.SRX1670084.tsv.gz tests/paste_regression/partial.SRX1670084.tsv.gz
 new file mode 100644
 index 0000000..c747675
 Binary files /dev/null and b/tests/paste_regression/partial.SRX1670084.tsv.gz differ
-diff --git a/tests/paste_regression/paste.ngl b/tests/paste_regression/paste.ngl
+diff --git tests/paste_regression/paste.ngl tests/paste_regression/paste.ngl
 new file mode 100644
 index 0000000..b0ea33c
 --- /dev/null
@@ -3642,7 +3733,7 @@ index 0000000..b0ea33c
 +
 +__paste(['partial.SAMEA2581908.tsv.gz', 'partial.SRX1670084.tsv.gz'],
 +    headers=['SAMEA2581908', 'SRX1670084'], ofile='output.txt')
-diff --git a/tests/preprocess/expected.endstrim.fq b/tests/preprocess/expected.endstrim.fq
+diff --git tests/preprocess/expected.endstrim.fq tests/preprocess/expected.endstrim.fq
 index af9e28e..b1e2181 100644
 --- a/tests/preprocess/expected.endstrim.fq
 +++ b/tests/preprocess/expected.endstrim.fq
@@ -3654,7 +3745,7 @@ index af9e28e..b1e2181 100644
 +GTCAGGACAAGAAAGACAANTCCAATTNACATT
 ++
 +aaabaa`]baaaaa_aab]a^^`b`aYaW]aba
-diff --git a/tests/preprocess/expected.endstrim31.fq b/tests/preprocess/expected.endstrim31.fq
+diff --git tests/preprocess/expected.endstrim31.fq tests/preprocess/expected.endstrim31.fq
 index e69de29..3f60b15 100644
 --- a/tests/preprocess/expected.endstrim31.fq
 +++ b/tests/preprocess/expected.endstrim31.fq
@@ -3663,7 +3754,7 @@ index e69de29..3f60b15 100644
 +GTCAGGACAAGAAAGACAANTCCAATTNACATT
 ++
 +aaabaa`]baaaaa_aab]a^^`b`aYaW]aba
-diff --git a/tests/preprocess/expected.fq b/tests/preprocess/expected.fq
+diff --git tests/preprocess/expected.fq tests/preprocess/expected.fq
 index 0cf8f65..edc0685 100644
 --- a/tests/preprocess/expected.fq
 +++ b/tests/preprocess/expected.fq
@@ -3675,468 +3766,3 @@ index 0cf8f65..edc0685 100644
 +AGGACAAGAAAGACAANTCCAATTNACATT
 ++
 +baa`]baaaaa_aab]a^^`b`aYaW]aba
-diff --git a/tests/preprocess/expected.substrim.fq b/tests/preprocess/expected.substrim.fq
-index eb71c8c..18b555b 100644
---- a/tests/preprocess/expected.substrim.fq
-+++ b/tests/preprocess/expected.substrim.fq
-@@ -6,3 +6,7 @@ aaabaa`]baaaaa_aab]
- GGAAACACTACTTAGGCTTATAAGATC
- +
- ababbaaabaaaaa`]`ba`]`aaaaY
-+@With_High_Quality_Ns
-+GTCAGGACAAGAAAGACAANTCCAATTNACATT
-++
-+aaabaa`]baaaaa_aab]a^^`b`aYaW]aba
-diff --git a/tests/preprocess/expected.substrim.n_to_zero_quality.fq b/tests/preprocess/expected.substrim.n_to_zero_quality.fq
-new file mode 100644
-index 0000000..3fabf4c
---- /dev/null
-+++ b/tests/preprocess/expected.substrim.n_to_zero_quality.fq
-@@ -0,0 +1,12 @@
-+@IRIS:7:1:17:394#0/1
-+GTCAGGACAAGAAAGACAA
-++
-+aaabaa`]baaaaa_aab]
-+@IRIS:7:1:17:800#0/1
-+GGAAACACTACTTAGGCTTATAAGATC
-++
-+ababbaaabaaaaa`]`ba`]`aaaaY
-+@With_High_Quality_Ns
-+GTCAGGACAAGAAAGACAA
-++
-+aaabaa`]baaaaa_aab]
-diff --git a/tests/preprocess/preprocess.ngl b/tests/preprocess/preprocess.ngl
-index 8d3fd1d..ab53246 100644
---- a/tests/preprocess/preprocess.ngl
-+++ b/tests/preprocess/preprocess.ngl
-@@ -1,4 +1,4 @@
--ngless '0.5'
-+ngless '0.8'
- input = fastq('sample.fq')
- trim = 3
- input = preprocess(input) using |read|:
-@@ -30,3 +30,13 @@ input = preprocess(input) using |read|:
-     if read.avg_quality() < 31.9:
-         discard
- write(input, ofile='output.endstrim31.fq')
-+
-+
-+input = fastq('sample.fq')
-+input = preprocess(input) using |read|:
-+    read = read.n_to_zero_quality()
-+    read = substrim(read, min_quality=20)
-+    if len(read) < 10:
-+        discard
-+write(input, ofile='output.substrim.n_to_zero_quality.fq')
-+
-diff --git a/tests/preprocess/sample.fq b/tests/preprocess/sample.fq
-index ba80fa7..4c0b370 100644
---- a/tests/preprocess/sample.fq
-+++ b/tests/preprocess/sample.fq
-@@ -10,3 +10,7 @@ ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
- TGAAAGAT
- +IRIS:7:1:17:1479#0/1
- __a_X]``
-+@With_High_Quality_Ns
-+GTCAGGACAAGAAAGACAANTCCAATTNACATT
-++
-+aaabaa`]baaaaa_aab]a^^`b`aYaW]aba
-diff --git a/tests/preprocess3/expected.fqstats.tsv b/tests/preprocess3/expected.fqstats.tsv
-index cefd30f..cab11eb 100644
---- a/tests/preprocess3/expected.fqstats.tsv
-+++ b/tests/preprocess3/expected.fqstats.tsv
-@@ -6,6 +6,7 @@
- 0:minSeqLen	8
- 0:maxSeqLen	36
- 0:gcContent	0.3918918918918919
-+0:nonATCGFraction	3.896103896103896e-2
- 1:file	sample2.fq
- 1:encoding	Solexa (64 offset)
- 1:numSeqs	3
-@@ -13,6 +14,7 @@
- 1:minSeqLen	8
- 1:maxSeqLen	36
- 1:gcContent	0.3918918918918919
-+1:nonATCGFraction	3.896103896103896e-2
- 2:file	singles.fq
- 2:encoding	Solexa (64 offset)
- 2:numSeqs	3
-@@ -20,6 +22,7 @@
- 2:minSeqLen	8
- 2:maxSeqLen	36
- 2:gcContent	0.3918918918918919
-+2:nonATCGFraction	3.896103896103896e-2
- 3:file	preproc.lno4.pairs.1
- 3:encoding	Solexa (64 offset)
- 3:numSeqs	2
-@@ -27,6 +30,7 @@
- 3:minSeqLen	30
- 3:maxSeqLen	33
- 3:gcContent	0.38333333333333336
-+3:nonATCGFraction	4.7619047619047616e-2
- 4:file	preproc.lno4.pairs.2
- 4:encoding	Solexa (64 offset)
- 4:numSeqs	2
-@@ -34,6 +38,7 @@
- 4:minSeqLen	30
- 4:maxSeqLen	33
- 4:gcContent	0.38333333333333336
-+4:nonATCGFraction	4.7619047619047616e-2
- 5:file	preproc.lno4.singles
- 5:encoding	Solexa (64 offset)
- 5:numSeqs	2
-@@ -41,3 +46,4 @@
- 5:minSeqLen	30
- 5:maxSeqLen	33
- 5:gcContent	0.38333333333333336
-+5:nonATCGFraction	4.7619047619047616e-2
-diff --git a/tests/preprocess3/preprocess.ngl b/tests/preprocess3/preprocess.ngl
-index 99e3493..36cfde0 100644
---- a/tests/preprocess3/preprocess.ngl
-+++ b/tests/preprocess3/preprocess.ngl
-@@ -1,4 +1,4 @@
--ngless '0.6'
-+ngless '0.8'
- input = paired('sample.fq', 'sample2.fq', singles='singles.fq')
- trim = 3
- input = preprocess(input) using |read|:
-diff --git a/tests/preprocess_fastx_mocat/filter.ngl b/tests/preprocess_fastx_mocat/filter.ngl
-index 7e45bb3..6e37498 100644
---- a/tests/preprocess_fastx_mocat/filter.ngl
-+++ b/tests/preprocess_fastx_mocat/filter.ngl
-@@ -1,4 +1,4 @@
--ngless "0.0"
-+ngless "0.8"
- 
- input = paired('input.1.fq.gz', 'input.2.fq.gz')
- 
-diff --git a/tests/readlines/readlines.ngl b/tests/readlines/readlines.ngl
-index 97ddf8a..6eb5def 100644
---- a/tests/readlines/readlines.ngl
-+++ b/tests/readlines/readlines.ngl
-@@ -1,4 +1,4 @@
--ngless "0.0"
-+ngless "0.8"
- 
- input = readlines('input.txt')
- print(input[0])
-diff --git a/tests/regression-write-fqgz/README.md b/tests/regression-write-fqgz/README.md
-new file mode 100644
-index 0000000..1a869db
---- /dev/null
-+++ b/tests/regression-write-fqgz/README.md
-@@ -0,0 +1,23 @@
-+# Issue #59
-+
-+https://github.com/luispedro/ngless/issues/59
-+
-+
-+Given
-+    sample/A.pair.1.fq.gz
-+    sample/A.pair.2.fq.gz
-+    sample/B.pair.1.fq.gz
-+    sample/B.pair.2.fq.gz
-+    sample/C.single.fq.gz
-+
-+and
-+
-+    ngless "0.7"
-+    import "mocat" version "0.0"
-+
-+    input = load_mocat_sample(sample)
-+    write(input, ofile=tmpdir/output.fq)
-+
-+Produces `output.pair.1.fq`, `output.pair.2.fq`, `output.single.fq` all in the
-+original compression instead of following the extension provided.
-+
-diff --git a/tests/regression-write-fqgz/expected.pair.1.fq b/tests/regression-write-fqgz/expected.pair.1.fq
-new file mode 100644
-index 0000000..6fc214f
---- /dev/null
-+++ b/tests/regression-write-fqgz/expected.pair.1.fq
-@@ -0,0 +1,24 @@
-+@IRIS:7:1:17:394#0/1
-+GTCAGGACAAGAAAGACAANTCCAATTNACATT
-++IRIS:7:1:17:394#0/1
-+aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
-+@IRIS:7:1:17:800#0/1
-+GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
-++IRIS:7:1:17:800#0/1
-+ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
-+@IRIS:7:1:17:1479#0/1
-+TGAAAGAT
-++IRIS:7:1:17:1479#0/1
-+__a_X]``
-+@IRIS:7:1:17:394#0/1
-+GTCAGGACAAGAAAGACAANTCCAATTNACATT
-++IRIS:7:1:17:394#0/1
-+aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
-+@IRIS:7:1:17:800#0/1
-+GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
-++IRIS:7:1:17:800#0/1
-+ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
-+@IRIS:7:1:17:1479#0/1
-+TGAAAGAT
-++IRIS:7:1:17:1479#0/1
-+__a_X]``
-diff --git a/tests/regression-write-fqgz/expected.pair.2.fq b/tests/regression-write-fqgz/expected.pair.2.fq
-new file mode 100644
-index 0000000..03b63f4
---- /dev/null
-+++ b/tests/regression-write-fqgz/expected.pair.2.fq
-@@ -0,0 +1,24 @@
-+@IRIS:7:1:17:394#0/2
-+GTCAGGACAAGAAAGACAANTCCAATTNACATT
-++IRIS:7:1:17:394#0/2
-+aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
-+@IRIS:7:1:17:800#0/2
-+GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
-++IRIS:7:1:17:800#0/2
-+ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
-+@IRIS:7:1:17:1479#0/2
-+TGAAAGAT
-++IRIS:7:1:17:1479#0/2
-+__a_X]``
-+@IRIS:7:1:17:394#0/2
-+GTCAGGACAAGAAAGACAANTCCAATTNACATT
-++IRIS:7:1:17:394#0/2
-+aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
-+@IRIS:7:1:17:800#0/2
-+GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
-++IRIS:7:1:17:800#0/2
-+ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
-+@IRIS:7:1:17:1479#0/2
-+TGAAAGAT
-++IRIS:7:1:17:1479#0/2
-+__a_X]``
-diff --git a/tests/regression-write-fqgz/expected.singles.fq b/tests/regression-write-fqgz/expected.singles.fq
-new file mode 100644
-index 0000000..48c3a15
---- /dev/null
-+++ b/tests/regression-write-fqgz/expected.singles.fq
-@@ -0,0 +1,24 @@
-+@IRIS:7:1:17:394#0
-+GTCAGGACAAGAAAGACAANTCCAATTNACATT
-++IRIS:7:1:17:394#0
-+aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
-+@IRIS:7:1:17:800#0
-+GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
-++IRIS:7:1:17:800#0
-+ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
-+@IRIS:7:1:17:1479#0
-+TGAAAGAT
-++IRIS:7:1:17:1479#0
-+__a_X]``
-+@IRIS:7:1:17:394#0
-+GTCAGGACAAGAAAGACAANTCCAATTNACATT
-++IRIS:7:1:17:394#0
-+aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
-+@IRIS:7:1:17:800#0
-+GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
-++IRIS:7:1:17:800#0
-+ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
-+@IRIS:7:1:17:1479#0
-+TGAAAGAT
-++IRIS:7:1:17:1479#0
-+__a_X]``
-diff --git a/tests/regression-write-fqgz/sample/A.pair.1.fq.gz b/tests/regression-write-fqgz/sample/A.pair.1.fq.gz
-new file mode 120000
-index 0000000..4038bc1
---- /dev/null
-+++ b/tests/regression-write-fqgz/sample/A.pair.1.fq.gz
-@@ -0,0 +1 @@
-+../../mocat_sample_gz_paired/sample/sample.pair.1.fq.gz
-\ No newline at end of file
-diff --git a/tests/regression-write-fqgz/sample/A.pair.2.fq.gz b/tests/regression-write-fqgz/sample/A.pair.2.fq.gz
-new file mode 120000
-index 0000000..e21723b
---- /dev/null
-+++ b/tests/regression-write-fqgz/sample/A.pair.2.fq.gz
-@@ -0,0 +1 @@
-+../../mocat_sample_gz_paired/sample/sample.pair.2.fq.gz
-\ No newline at end of file
-diff --git a/tests/regression-write-fqgz/sample/A.single.fq.gz b/tests/regression-write-fqgz/sample/A.single.fq.gz
-new file mode 120000
-index 0000000..756a645
---- /dev/null
-+++ b/tests/regression-write-fqgz/sample/A.single.fq.gz
-@@ -0,0 +1 @@
-+../../mocat_sample_gz_paired/sample/sample.single.fq.gz
-\ No newline at end of file
-diff --git a/tests/regression-write-fqgz/sample/B.pair.1.fq.gz b/tests/regression-write-fqgz/sample/B.pair.1.fq.gz
-new file mode 120000
-index 0000000..4038bc1
---- /dev/null
-+++ b/tests/regression-write-fqgz/sample/B.pair.1.fq.gz
-@@ -0,0 +1 @@
-+../../mocat_sample_gz_paired/sample/sample.pair.1.fq.gz
-\ No newline at end of file
-diff --git a/tests/regression-write-fqgz/sample/B.pair.2.fq.gz b/tests/regression-write-fqgz/sample/B.pair.2.fq.gz
-new file mode 120000
-index 0000000..e21723b
---- /dev/null
-+++ b/tests/regression-write-fqgz/sample/B.pair.2.fq.gz
-@@ -0,0 +1 @@
-+../../mocat_sample_gz_paired/sample/sample.pair.2.fq.gz
-\ No newline at end of file
-diff --git a/tests/regression-write-fqgz/sample/B.single.fq.gz b/tests/regression-write-fqgz/sample/B.single.fq.gz
-new file mode 120000
-index 0000000..756a645
---- /dev/null
-+++ b/tests/regression-write-fqgz/sample/B.single.fq.gz
-@@ -0,0 +1 @@
-+../../mocat_sample_gz_paired/sample/sample.single.fq.gz
-\ No newline at end of file
-diff --git a/tests/regression-write-fqgz/write-out.ngl b/tests/regression-write-fqgz/write-out.ngl
-new file mode 100644
-index 0000000..d9a0c0b
---- /dev/null
-+++ b/tests/regression-write-fqgz/write-out.ngl
-@@ -0,0 +1,5 @@
-+ngless "0.7"
-+import "mocat" version "0.0"
-+
-+input = load_mocat_sample('sample')
-+write(input, ofile='output.fq')
-diff --git a/tests/reuse/reuse.ngl b/tests/reuse/reuse.ngl
-index c20ece2..15ba774 100644
---- a/tests/reuse/reuse.ngl
-+++ b/tests/reuse/reuse.ngl
-@@ -1,4 +1,4 @@
--ngless '0.0'
-+ngless '0.8'
- 
- MAPPED = {mapped}
- 
-diff --git a/tests/same-hash-collect-2/expected.counts.txt b/tests/same-hash-collect-2/expected.counts.txt
-index 915139f..635b343 100644
---- a/tests/same-hash-collect-2/expected.counts.txt
-+++ b/tests/same-hash-collect-2/expected.counts.txt
-@@ -1,6 +1,6 @@
--# Output hash: 458595b9b73025060ba4dc00cdab589e
-+# Output hash: 1052fe8887d9b824c0853b335504c49c
- # Output generated by:
--#     ngless "0.6"
-+#     ngless "0.8"
- #     import "parallel" version "0.6"
- #     
- #     samples = ['basic']
-diff --git a/tests/same-hash-collect-2/hashcollect.ngl b/tests/same-hash-collect-2/hashcollect.ngl
-index fd59452..80318e7 100644
---- a/tests/same-hash-collect-2/hashcollect.ngl
-+++ b/tests/same-hash-collect-2/hashcollect.ngl
-@@ -1,4 +1,4 @@
--ngless "0.6"
-+ngless "0.8"
- import "parallel" version "0.6"
- 
- samples = ['basic']
-diff --git a/tests/same-hash-collect/expected.counts.txt b/tests/same-hash-collect/expected.counts.txt
-index 8334b67..bf541af 100644
---- a/tests/same-hash-collect/expected.counts.txt
-+++ b/tests/same-hash-collect/expected.counts.txt
-@@ -1,6 +1,6 @@
--# Output hash: 458595b9b73025060ba4dc00cdab589e
-+# Output hash: 1052fe8887d9b824c0853b335504c49c
- # Output generated by:
--#     ngless "0.6"
-+#     ngless "0.8"
- #     import "parallel" version "0.6"
- #     
- #     samples = ['basic']
-diff --git a/tests/same-hash-collect/hashcollect.ngl b/tests/same-hash-collect/hashcollect.ngl
-index 8af5491..ee72b19 100644
---- a/tests/same-hash-collect/hashcollect.ngl
-+++ b/tests/same-hash-collect/hashcollect.ngl
-@@ -1,4 +1,4 @@
--ngless "0.6"
-+ngless "0.8"
- import "parallel" version "0.6"
- 
- samples = ['basic']
-diff --git a/tests/samfile-headers/header.ngl b/tests/samfile-headers/header.ngl
-index 715493b..548ede9 100644
---- a/tests/samfile-headers/header.ngl
-+++ b/tests/samfile-headers/header.ngl
-@@ -1,3 +1,3 @@
--ngless '0.7'
-+ngless '0.8'
- write(samfile('headerless.sam', headers='headers'), ofile='output.sam')
- 
-diff --git a/tests/write-hash/expected.hash.txt b/tests/write-hash/expected.hash.txt
-index b2c5aac..6f050dd 100644
---- a/tests/write-hash/expected.hash.txt
-+++ b/tests/write-hash/expected.hash.txt
-@@ -1,5 +1,5 @@
- # Output generated by:
--#     ngless '0.6'
-+#     ngless '0.8'
- #     
- #     counts = count(samfile('seq1_2.sam.bz2'),
- #                     features=['seqname'],
-@@ -8,7 +8,7 @@
- #     
- #     write(counts, ofile='output.hash.txt', auto_comments=[{script}, {hash}])
- #     
--# Output hash: 461a3ca623231767eb4b43b3551bb93d
-+# Output hash: 07f65e0dbab19789ec66727c655e7101
- 	seq1_2.sam.bz2
- -1	1
- seq1	99990
-diff --git a/tests/write-hash/write.ngl b/tests/write-hash/write.ngl
-index a9e0d11..704967c 100644
---- a/tests/write-hash/write.ngl
-+++ b/tests/write-hash/write.ngl
-@@ -1,4 +1,4 @@
--ngless '0.6'
-+ngless '0.8'
- 
- counts = count(samfile('seq1_2.sam.bz2'),
-                 features=['seqname'],
-diff --git a/tests/write-hash2/expected.hash2.txt b/tests/write-hash2/expected.hash2.txt
-index 01101bd..3efe40e 100644
---- a/tests/write-hash2/expected.hash2.txt
-+++ b/tests/write-hash2/expected.hash2.txt
-@@ -1,5 +1,5 @@
- # Output generated by:
--#     ngless '0.6'
-+#     ngless '0.8'
- #     
- #     sf = samfile('seq1_2.sam.bz2')
- #     recounts = count(sf,
-@@ -9,7 +9,7 @@
- #     
- #     write(recounts, ofile='output.hash2.txt', auto_comments=[{script}, {hash}])
- #     
--# Output hash: 461a3ca623231767eb4b43b3551bb93d
-+# Output hash: 07f65e0dbab19789ec66727c655e7101
- 	seq1_2.sam.bz2
- -1	1
- seq1	99990
-diff --git a/tests/write-hash2/write2.ngl b/tests/write-hash2/write2.ngl
-index bdf8b4b..610ad1b 100644
---- a/tests/write-hash2/write2.ngl
-+++ b/tests/write-hash2/write2.ngl
-@@ -1,4 +1,4 @@
--ngless '0.6'
-+ngless '0.8'
- 
- sf = samfile('seq1_2.sam.bz2')
- recounts = count(sf,
-diff --git a/tests/write_fq/read_write.ngl b/tests/write_fq/read_write.ngl
-index c8c306c..47964cd 100644
---- a/tests/write_fq/read_write.ngl
-+++ b/tests/write_fq/read_write.ngl
-@@ -1,3 +1,3 @@
--ngless '0.0'
-+ngless '0.8'
- input = fastq('short.fq')
- write(input, ofile='output.fq')
-diff --git a/tests/write_fq_inline/read_write_inline.ngl b/tests/write_fq_inline/read_write_inline.ngl
-index c29b808..0a4d73e 100644
---- a/tests/write_fq_inline/read_write_inline.ngl
-+++ b/tests/write_fq_inline/read_write_inline.ngl
-@@ -1,2 +1,2 @@
--ngless '0.0'
-+ngless '0.8'
- write(fastq('short.fq'), ofile='output.fq')
