@@ -1,7 +1,7 @@
 diff --git ChangeLog ChangeLog
 index 4424fd1..04d834a 100644
---- a/ChangeLog
-+++ b/ChangeLog
+--- ChangeLog
++++ ChangeLog
 @@ -1,3 +1,14 @@
 +Version 0.7.1+
 +	* Add minimap2 support as alternative mapper
@@ -19,8 +19,8 @@ index 4424fd1..04d834a 100644
  	* Fix when-true flag usage with external modules
 diff --git Execs/Bench.hs Execs/Bench.hs
 index 2e30aee..354fc94 100644
---- a/Execs/Bench.hs
-+++ b/Execs/Bench.hs
+--- Execs/Bench.hs
++++ Execs/Bench.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2016
 +{- Copyright 2016-2018
@@ -91,8 +91,8 @@ index 2e30aee..354fc94 100644
      ]
 diff --git Execs/Main.hs Execs/Main.hs
 index f3b7793..2c747e3 100644
---- a/Execs/Main.hs
-+++ b/Execs/Main.hs
+--- Execs/Main.hs
++++ Execs/Main.hs
 @@ -42,7 +42,7 @@ import System.FilePath
  import System.Directory
  import Control.Monad.Extra (whenJust)
@@ -129,8 +129,8 @@ index f3b7793..2c747e3 100644
  modeExec opts@DefaultMode{} = do
 diff --git Makefile Makefile
 index 9d3cc19..0f943b2 100644
---- a/Makefile
-+++ b/Makefile
+--- Makefile
++++ Makefile
 @@ -42,16 +42,24 @@ MEGAHIT_TAR = v1.1.1.tar.gz
  MEGAHIT_SHA1 = e82308db9a351ea0ccdaf4bebead86ca338a6f0c
  MEGAHIT_TARGET = megahit
@@ -196,8 +196,8 @@ index 9d3cc19..0f943b2 100644
  $(HTML_LIBS_DIR)/%.js:
 diff --git NGLess/BuiltinFunctions.hs NGLess/BuiltinFunctions.hs
 index 4ecee0a..4f5c8e7 100644
---- a/NGLess/BuiltinFunctions.hs
-+++ b/NGLess/BuiltinFunctions.hs
+--- NGLess/BuiltinFunctions.hs
++++ NGLess/BuiltinFunctions.hs
 @@ -73,6 +73,7 @@ countArgs =
      ,ArgInformation "discard_zeros" False NGLBool []
      ,ArgInformation "include_minus1" False NGLBool []
@@ -216,8 +216,8 @@ index 4ecee0a..4f5c8e7 100644
  filterArgs =
 diff --git NGLess/BuiltinModules/AsReads.hs NGLess/BuiltinModules/AsReads.hs
 index 4f70622..0bff1b7 100644
---- a/NGLess/BuiltinModules/AsReads.hs
-+++ b/NGLess/BuiltinModules/AsReads.hs
+--- NGLess/BuiltinModules/AsReads.hs
++++ NGLess/BuiltinModules/AsReads.hs
 @@ -9,11 +9,13 @@ module BuiltinModules.AsReads
      ) where
  
@@ -310,8 +310,8 @@ index 4f70622..0bff1b7 100644
  as_reads_Function = Function
 diff --git NGLess/BuiltinModules/QCStats.hs NGLess/BuiltinModules/QCStats.hs
 index a6f0ddf..08efb90 100644
---- a/NGLess/BuiltinModules/QCStats.hs
-+++ b/NGLess/BuiltinModules/QCStats.hs
+--- NGLess/BuiltinModules/QCStats.hs
++++ NGLess/BuiltinModules/QCStats.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2017 NGLess Authors
 +{- Copyright 2017-2018 NGLess Authors
@@ -330,8 +330,8 @@ index a6f0ddf..08efb90 100644
  loadModule :: T.Text -> NGLessIO Module
 diff --git NGLess/Citations.hs NGLess/Citations.hs
 index 607ce26..fc2f274 100644
---- a/NGLess/Citations.hs
-+++ b/NGLess/Citations.hs
+--- NGLess/Citations.hs
++++ NGLess/Citations.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2017 NGLess Authors
 +{- Copyright 2017-2018 NGLess Authors
@@ -356,8 +356,8 @@ index 607ce26..fc2f274 100644
 +    in (S.toList . S.fromList) (modCits ++ useCits)
 diff --git NGLess/Data/FastQ.hs NGLess/Data/FastQ.hs
 index 92ac7ca..802b163 100644
---- a/NGLess/Data/FastQ.hs
-+++ b/NGLess/Data/FastQ.hs
+--- NGLess/Data/FastQ.hs
++++ NGLess/Data/FastQ.hs
 @@ -1,4 +1,5 @@
  {-# LANGUAGE FlexibleContexts, ScopedTypeVariables, MultiWayIf #-}
 +{-# LANGUAGE TemplateHaskell, QuasiQuotes #-}
@@ -599,8 +599,8 @@ index 92ac7ca..802b163 100644
  qualityPercentiles :: FQStatistics -> [(Int, Int, Int, Int)]
 diff --git NGLess/Data/Sam.hs NGLess/Data/Sam.hs
 index 76ed4b0..ea0c154 100644
---- a/NGLess/Data/Sam.hs
-+++ b/NGLess/Data/Sam.hs
+--- NGLess/Data/Sam.hs
++++ NGLess/Data/Sam.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2014-2017 NGLess Authors
 +{- Copyright 2014-2018 NGLess Authors
@@ -706,8 +706,8 @@ index 76ed4b0..ea0c154 100644
 -
 diff --git NGLess/Dependencies/Embedded.hs NGLess/Dependencies/Embedded.hs
 index 481949a..cdb8b92 100644
---- a/NGLess/Dependencies/Embedded.hs
-+++ b/NGLess/Dependencies/Embedded.hs
+--- NGLess/Dependencies/Embedded.hs
++++ NGLess/Dependencies/Embedded.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2015-2017 NGLess Authors
 +{- Copyright 2015-2018 NGLess Authors
@@ -744,8 +744,8 @@ index 481949a..cdb8b92 100644
 +
 diff --git NGLess/Dependencies/embedded.c NGLess/Dependencies/embedded.c
 index 49209cf..9c036d8 100644
---- a/NGLess/Dependencies/embedded.c
-+++ b/NGLess/Dependencies/embedded.c
+--- NGLess/Dependencies/embedded.c
++++ NGLess/Dependencies/embedded.c
 @@ -3,6 +3,7 @@
  #include "prodigal_data.c"
  #include "bwa_data.c"
@@ -776,8 +776,8 @@ index 49209cf..9c036d8 100644
  #endif
 diff --git NGLess/FileManagement.hs NGLess/FileManagement.hs
 index ff549b0..3e8246e 100644
---- a/NGLess/FileManagement.hs
-+++ b/NGLess/FileManagement.hs
+--- NGLess/FileManagement.hs
++++ NGLess/FileManagement.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2013-2017 NGLess Authors
 +{- Copyright 2013-2018 NGLess Authors
@@ -808,8 +808,8 @@ index ff549b0..3e8246e 100644
      Just bin -> checkExecutable "NGLESS_MEGAHIT_BIN" bin
 diff --git NGLess/FileOrStream.hs NGLess/FileOrStream.hs
 index d9a3b9c..affe9b6 100644
---- a/NGLess/FileOrStream.hs
-+++ b/NGLess/FileOrStream.hs
+--- NGLess/FileOrStream.hs
++++ NGLess/FileOrStream.hs
 @@ -40,8 +40,8 @@ asFile (Stream fp istream) =
  
  asStream :: FileOrStream -> (FilePath, C.Source NGLessIO ByteLine)
@@ -823,8 +823,8 @@ index d9a3b9c..affe9b6 100644
  
 diff --git NGLess/Interpret.hs NGLess/Interpret.hs
 index a78d80f..aff91e5 100644
---- a/NGLess/Interpret.hs
-+++ b/NGLess/Interpret.hs
+--- NGLess/Interpret.hs
++++ NGLess/Interpret.hs
 @@ -1,12 +1,14 @@
 -{- Copyright 2015-2017 NGLess Authors
 +{- Copyright 2013-2018 NGLess Authors
@@ -1113,8 +1113,8 @@ index a78d80f..aff91e5 100644
          return . NGOBool $ cmp op a' b'
 diff --git NGLess/Interpretation/Count.hs NGLess/Interpretation/Count.hs
 index 9627b09..3e8a289 100644
---- a/NGLess/Interpretation/Count.hs
-+++ b/NGLess/Interpretation/Count.hs
+--- NGLess/Interpretation/Count.hs
++++ NGLess/Interpretation/Count.hs
 @@ -6,7 +6,6 @@
  module Interpretation.Count
      ( executeCount
@@ -1355,8 +1355,8 @@ index 9627b09..3e8a289 100644
          gffSize g = (gffEnd g - gffStart g) + 1 -- gff format is inclusive at both ends!
 diff --git NGLess/Interpretation/FastQ.hs NGLess/Interpretation/FastQ.hs
 index e84ee0e..1b0b34a 100644
---- a/NGLess/Interpretation/FastQ.hs
-+++ b/NGLess/Interpretation/FastQ.hs
+--- NGLess/Interpretation/FastQ.hs
++++ NGLess/Interpretation/FastQ.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2013-2017 NGLess Authors
 +{- Copyright 2013-2018 NGLess Authors
@@ -1437,8 +1437,8 @@ index e84ee0e..1b0b34a 100644
  executeShortReadsMethod (MethodName other) _ _ _ = throwShouldNotOccur ("Unknown short read method: " ++ show other)
 diff --git NGLess/Interpretation/Map.hs NGLess/Interpretation/Map.hs
 index 619b849..5d77a1e 100644
---- a/NGLess/Interpretation/Map.hs
-+++ b/NGLess/Interpretation/Map.hs
+--- NGLess/Interpretation/Map.hs
++++ NGLess/Interpretation/Map.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2013-2017 NGLess Authors
 +{- Copyright 2013-2018 NGLess Authors
@@ -1497,8 +1497,8 @@ index 619b849..5d77a1e 100644
              [     "\t",  T.unpack name, "\n"
 diff --git NGLess/Interpretation/Select.hs NGLess/Interpretation/Select.hs
 index 7741ad7..4c08bfc 100644
---- a/NGLess/Interpretation/Select.hs
-+++ b/NGLess/Interpretation/Select.hs
+--- NGLess/Interpretation/Select.hs
++++ NGLess/Interpretation/Select.hs
 @@ -18,7 +18,7 @@ import qualified Data.Text.Encoding as TE
  import           Data.Bits (Bits(..))
  import           Control.Monad.Except (throwError)
@@ -1561,8 +1561,8 @@ index 7741ad7..4c08bfc 100644
                  .| CL.concat
 diff --git NGLess/Interpretation/Substrim.hs NGLess/Interpretation/Substrim.hs
 index ee6968b..d6886a8 100644
---- a/NGLess/Interpretation/Substrim.hs
-+++ b/NGLess/Interpretation/Substrim.hs
+--- NGLess/Interpretation/Substrim.hs
++++ NGLess/Interpretation/Substrim.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2013-2016 NGLess Authors
 +{- Copyright 2013-2018 NGLess Authors
@@ -1622,8 +1622,8 @@ index ee6968b..d6886a8 100644
  
 diff --git NGLess/Interpretation/Write.hs NGLess/Interpretation/Write.hs
 index 3988aa9..7a426ec 100644
---- a/NGLess/Interpretation/Write.hs
-+++ b/NGLess/Interpretation/Write.hs
+--- NGLess/Interpretation/Write.hs
++++ NGLess/Interpretation/Write.hs
 @@ -143,6 +143,7 @@ _formatFQOname base insert
      | "{index}" `isInfixOf` base = return $ replace "{index}" insert base
      | endswith ".fq" base = return $ removeEnd base ".fq" ++ "." ++ insert ++ ".fq"
@@ -1662,8 +1662,8 @@ index 3988aa9..7a426ec 100644
                  moveOrCopyCompressFQs singles ofile
 diff --git NGLess/JSONScript.hs NGLess/JSONScript.hs
 index 4e28c54..67c7a0d 100644
---- a/NGLess/JSONScript.hs
-+++ b/NGLess/JSONScript.hs
+--- NGLess/JSONScript.hs
++++ NGLess/JSONScript.hs
 @@ -79,6 +79,8 @@ encodeBOp BOpLTE = "lte"
  encodeBOp BOpEQ = "eq"
  encodeBOp BOpNEQ = "neq"
@@ -1675,8 +1675,8 @@ index 4e28c54..67c7a0d 100644
  encodeUOp UOpMinus = "negate"
 diff --git NGLess/Language.hs NGLess/Language.hs
 index 435062c..6930e0b 100644
---- a/NGLess/Language.hs
-+++ b/NGLess/Language.hs
+--- NGLess/Language.hs
++++ NGLess/Language.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2013-2017 NGLess Authors
 +{- Copyright 2013-2018 NGLess Authors
@@ -1694,8 +1694,8 @@ index 435062c..6930e0b 100644
  -- | index expression encodes what is inside an index variable
 diff --git NGLess/Modules.hs NGLess/Modules.hs
 index 3a91564..9838306 100644
---- a/NGLess/Modules.hs
-+++ b/NGLess/Modules.hs
+--- NGLess/Modules.hs
++++ NGLess/Modules.hs
 @@ -61,6 +61,7 @@ data ArgCheck =
  data FunctionCheck =
              FunctionCheckMinNGLessVersion (Int, Int) -- ^ first version where this function can be used
@@ -1706,8 +1706,8 @@ index 3a91564..9838306 100644
  -- | Basic information about argument to a function
 diff --git NGLess/NGLess/NGError.hs NGLess/NGLess/NGError.hs
 index a425cd0..32eafb1 100644
---- a/NGLess/NGLess/NGError.hs
-+++ b/NGLess/NGLess/NGError.hs
+--- NGLess/NGLess/NGError.hs
++++ NGLess/NGLess/NGError.hs
 @@ -1,4 +1,4 @@
 -{-# LANGUAGE GeneralizedNewtypeDeriving, MultiParamTypeClasses, TypeFamilies, FlexibleContexts #-}
 +{-# LANGUAGE GeneralizedNewtypeDeriving, MultiParamTypeClasses, TypeFamilies, FlexibleContexts, UndecidableInstances #-}
@@ -1778,8 +1778,8 @@ index a425cd0..32eafb1 100644
  throwShouldNotOccur :: (MonadError NGError m) => String -> m a
 diff --git NGLess/Output.hs NGLess/Output.hs
 index 4448aa9..271c2b3 100644
---- a/NGLess/Output.hs
-+++ b/NGLess/Output.hs
+--- NGLess/Output.hs
++++ NGLess/Output.hs
 @@ -108,6 +108,7 @@ data FQInfo = FQInfo
                  { fileName :: String
                  , scriptLno :: !Int
@@ -1815,8 +1815,8 @@ index 4448aa9..271c2b3 100644
          encodeMapStats MappingInfo{..} = [mi_inputFile,   show mi_lno, mi_reference, show mi_totalReads, show mi_totalAligned, show mi_totalUnique]
 diff --git NGLess/Parse.hs NGLess/Parse.hs
 index cc8f5fb..574bcea 100644
---- a/NGLess/Parse.hs
-+++ b/NGLess/Parse.hs
+--- NGLess/Parse.hs
++++ NGLess/Parse.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2013-2017 NGLess Authors
 +{- Copyright 2013-2018 NGLess Authors
@@ -1834,8 +1834,8 @@ index cc8f5fb..574bcea 100644
  sliceList :: Int -> Int -> [a] -> [a]
 diff --git NGLess/StandardModules/Mappers/Bwa.hs NGLess/StandardModules/Mappers/Bwa.hs
 index 24b1212..eb49cc4 100644
---- a/NGLess/StandardModules/Mappers/Bwa.hs
-+++ b/NGLess/StandardModules/Mappers/Bwa.hs
+--- NGLess/StandardModules/Mappers/Bwa.hs
++++ NGLess/StandardModules/Mappers/Bwa.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2013-2016 NGLess Authors
 +{- Copyright 2013-2018 NGLess Authors
@@ -2047,8 +2047,8 @@ index 0000000..e1957be
 +
 diff --git NGLess/StandardModules/Mappers/Soap.hs NGLess/StandardModules/Mappers/Soap.hs
 index a73b402..c6af48d 100644
---- a/NGLess/StandardModules/Mappers/Soap.hs
-+++ b/NGLess/StandardModules/Mappers/Soap.hs
+--- NGLess/StandardModules/Mappers/Soap.hs
++++ NGLess/StandardModules/Mappers/Soap.hs
 @@ -26,10 +26,11 @@ import qualified Data.Conduit.TQueue as CA
  import qualified Data.Conduit.Process as CP
  import qualified Data.Conduit.List as CL
@@ -2128,8 +2128,8 @@ index 0000000..e1a70a1
 +                    ," in arXiv (2018) https://arxiv.org/abs/1708.01492"]
 diff --git NGLess/StandardModules/Mocat.hs NGLess/StandardModules/Mocat.hs
 index 0bb9001..9fbc4af 100644
---- a/NGLess/StandardModules/Mocat.hs
-+++ b/NGLess/StandardModules/Mocat.hs
+--- NGLess/StandardModules/Mocat.hs
++++ NGLess/StandardModules/Mocat.hs
 @@ -97,7 +97,7 @@ executeParseCoord (NGOString coordfp) _ = do
      newfp <- makeNGLTempFile coordfp' "converted_" ".gtf" $ \hout ->
          C.runConduit $
@@ -2141,8 +2141,8 @@ index 0bb9001..9fbc4af 100644
                  .| C.sinkHandle hout
 diff --git NGLess/StandardModules/NGLStdlib.hs NGLess/StandardModules/NGLStdlib.hs
 index 87b35a1..e7e92bc 100644
---- a/NGLess/StandardModules/NGLStdlib.hs
-+++ b/NGLess/StandardModules/NGLStdlib.hs
+--- NGLess/StandardModules/NGLStdlib.hs
++++ NGLess/StandardModules/NGLStdlib.hs
 @@ -13,6 +13,7 @@ import qualified StandardModules.Batch as Batch
  import qualified StandardModules.Samtools as Samtools
  import qualified StandardModules.Mocat as Mocat
@@ -2160,8 +2160,8 @@ index 87b35a1..e7e92bc 100644
  
 diff --git NGLess/StandardModules/Parallel.hs NGLess/StandardModules/Parallel.hs
 index c0d59c2..d6346e7 100644
---- a/NGLess/StandardModules/Parallel.hs
-+++ b/NGLess/StandardModules/Parallel.hs
+--- NGLess/StandardModules/Parallel.hs
++++ NGLess/StandardModules/Parallel.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2016-2017 NGLess Authors
 +{- Copyright 2016-2018 NGLess Authors
@@ -2301,8 +2301,8 @@ index c0d59c2..d6346e7 100644
  pasteCounts comments matchingRows headers inputs
 diff --git NGLess/Tokens.hs NGLess/Tokens.hs
 index 5e8b3a0..cc8abbb 100644
---- a/NGLess/Tokens.hs
-+++ b/NGLess/Tokens.hs
+--- NGLess/Tokens.hs
++++ NGLess/Tokens.hs
 @@ -1,13 +1,15 @@
 -{- Copyright 2013-2017 NGLess Authors
 +{- Copyright 2013-2018 NGLess Authors
@@ -2361,8 +2361,8 @@ index 5e8b3a0..cc8abbb 100644
                      , (">=", BOpGTE)
 diff --git NGLess/Types.hs NGLess/Types.hs
 index c9fb47d..6c550cf 100644
---- a/NGLess/Types.hs
-+++ b/NGLess/Types.hs
+--- NGLess/Types.hs
++++ NGLess/Types.hs
 @@ -209,6 +209,7 @@ checkbop BOpLTE a b = checknum a *> checknum b *> return (Just NGLBool)
  checkbop BOpEQ  a b = checknum a *> checknum b *> return (Just NGLBool)
  checkbop BOpNEQ a b = checknum a *> checknum b *> return (Just NGLBool)
@@ -2373,8 +2373,8 @@ index c9fb47d..6c550cf 100644
  softCheck expected expr = do
 diff --git NGLess/Utils/Conduit.hs NGLess/Utils/Conduit.hs
 index c9c6d06..98f7c04 100644
---- a/NGLess/Utils/Conduit.hs
-+++ b/NGLess/Utils/Conduit.hs
+--- NGLess/Utils/Conduit.hs
++++ NGLess/Utils/Conduit.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2013-2017 NGLess Authors
 +{- Copyright 2013-2018 NGLess Authors
@@ -2440,8 +2440,8 @@ index c9c6d06..98f7c04 100644
  
 diff --git NGLess/Validation.hs NGLess/Validation.hs
 index aadf317..d8640bd 100644
---- a/NGLess/Validation.hs
-+++ b/NGLess/Validation.hs
+--- NGLess/Validation.hs
++++ NGLess/Validation.hs
 @@ -1,7 +1,7 @@
 -{- Copyright 2013-2017 NGLess Authors
 +{- Copyright 2013-2018 NGLess Authors
@@ -2492,8 +2492,8 @@ index aadf317..d8640bd 100644
              asum $ flip map (methodChecks minfo) $ \case
 diff --git NGLess/Version.hs NGLess/Version.hs
 index fe6ff0f..2b87fcf 100644
---- a/NGLess/Version.hs
-+++ b/NGLess/Version.hs
+--- NGLess/Version.hs
++++ NGLess/Version.hs
 @@ -19,7 +19,7 @@ versionStr :: String
  versionStr = showVersion version
  
@@ -2505,8 +2505,8 @@ index fe6ff0f..2b87fcf 100644
  gitHashStr = $(gitHash)
 diff --git README.md README.md
 index 008b9ab..8c8821c 100644
---- a/README.md
-+++ b/README.md
+--- README.md
++++ README.md
 @@ -48,22 +48,22 @@ The recommended way to install NGLess is through
  Alternatively, a docker container with NGLess is available at
  [biocontainers](https://quay.io/repository/biocontainers/ngless):
@@ -2537,8 +2537,8 @@ index 008b9ab..8c8821c 100644
  
 diff --git Tests-Src/Tests.hs Tests-Src/Tests.hs
 index ce5c47a..0df265a 100644
---- a/Tests-Src/Tests.hs
-+++ b/Tests-Src/Tests.hs
+--- Tests-Src/Tests.hs
++++ Tests-Src/Tests.hs
 @@ -1,4 +1,4 @@
 -{- Copyright 2013-2017 NGLess Authors
 +{- Copyright 2013-2018 NGLess Authors
@@ -2659,8 +2659,8 @@ index ce5c47a..0df265a 100644
  
 diff --git Tests-Src/Tests/FastQ.hs Tests-Src/Tests/FastQ.hs
 index c13b05a..d3a0a37 100644
---- a/Tests-Src/Tests/FastQ.hs
-+++ b/Tests-Src/Tests/FastQ.hs
+--- Tests-Src/Tests/FastQ.hs
++++ Tests-Src/Tests/FastQ.hs
 @@ -11,7 +11,7 @@ import Test.Framework.Providers.HUnit
  import Test.Framework.Providers.QuickCheck2
  
@@ -2761,8 +2761,8 @@ index c13b05a..d3a0a37 100644
  
 diff --git Tests-Src/Tests/Utils.hs Tests-Src/Tests/Utils.hs
 index 0467893..ab3585c 100644
---- a/Tests-Src/Tests/Utils.hs
-+++ b/Tests-Src/Tests/Utils.hs
+--- Tests-Src/Tests/Utils.hs
++++ Tests-Src/Tests/Utils.hs
 @@ -13,14 +13,11 @@ import qualified Data.Text as T
  import qualified Data.ByteString as B
  import Control.Monad.IO.Class (liftIO)
@@ -3093,8 +3093,8 @@ index 0000000..f27354e
 + 	}
 diff --git docs/sources/Functions.rst docs/sources/Functions.rst
 index 6ec20c9..dccc2b2 100644
---- a/docs/sources/Functions.rst
-+++ b/docs/sources/Functions.rst
+--- docs/sources/Functions.rst
++++ docs/sources/Functions.rst
 @@ -402,6 +402,8 @@ Arguments by value:
  +-------------------+-----------------+------------+----------------+
  | discard_zeros     | Bool            | no         | false          |
@@ -3106,8 +3106,8 @@ index 6ec20c9..dccc2b2 100644
  If the features to count are ``['seqname']``, then each read will be assigned
 diff --git docs/sources/methods.md docs/sources/methods.md
 index 0558e63..ededb7c 100644
---- a/docs/sources/methods.md
-+++ b/docs/sources/methods.md
+--- docs/sources/methods.md
++++ docs/sources/methods.md
 @@ -10,6 +10,16 @@ They can also take arguments
      mapped = select(mapped) using |mr|:
          mr = mr.filter(min_match_size=30)
@@ -3127,8 +3127,8 @@ index 0558e63..ededb7c 100644
  Mapped reads contain several methods. *None of these methods changes its
 diff --git docs/sources/tutorial-gut-metagenomics.rst docs/sources/tutorial-gut-metagenomics.rst
 index b4e3046..e22e092 100644
---- a/docs/sources/tutorial-gut-metagenomics.rst
-+++ b/docs/sources/tutorial-gut-metagenomics.rst
+--- docs/sources/tutorial-gut-metagenomics.rst
++++ docs/sources/tutorial-gut-metagenomics.rst
 @@ -56,8 +56,8 @@ The rest of this tutorial is an explanation of the steps in this script.
  
  To run ngless, we need write a script. We start with a few imports::
@@ -3183,8 +3183,8 @@ index b4e3046..e22e092 100644
              discard
 diff --git docs/sources/tutorial-ocean-metagenomics.rst docs/sources/tutorial-ocean-metagenomics.rst
 index 8d26d8f..8a4d428 100644
---- a/docs/sources/tutorial-ocean-metagenomics.rst
-+++ b/docs/sources/tutorial-ocean-metagenomics.rst
+--- docs/sources/tutorial-ocean-metagenomics.rst
++++ docs/sources/tutorial-ocean-metagenomics.rst
 @@ -56,8 +56,8 @@ The rest of this tutorial is an explanation of the steps in this script.
  
  To run ngless, we need write a script. We start with a few imports::
@@ -3218,8 +3218,8 @@ index 8d26d8f..8a4d428 100644
  Full script
 diff --git docs/sources/whatsnew.rst docs/sources/whatsnew.rst
 index db8df5c..cc2a339 100644
---- a/docs/sources/whatsnew.rst
-+++ b/docs/sources/whatsnew.rst
+--- docs/sources/whatsnew.rst
++++ docs/sources/whatsnew.rst
 @@ -2,6 +2,44 @@
  What's New (History)
  ====================
@@ -3267,8 +3267,8 @@ index db8df5c..cc2a339 100644
  
 diff --git package.yaml package.yaml
 index d269ffb..e091f1a 100644
---- a/package.yaml
-+++ b/package.yaml
+--- package.yaml
++++ package.yaml
 @@ -26,7 +26,7 @@ dependencies:
    - bytestring
    - bytestring-lexing
@@ -3319,8 +3319,8 @@ index 0000000..eecb423
 +exec stack bench --benchmark-arguments "--output bench.html"
 diff --git stack.yaml stack.yaml
 index 285fc37..a4ed298 100644
---- a/stack.yaml
-+++ b/stack.yaml
+--- stack.yaml
++++ stack.yaml
 @@ -4,13 +4,16 @@
  
  # NOTE: When bumping stack's lts version, remember to rebuild and upload the
@@ -3341,8 +3341,8 @@ index 285fc37..a4ed298 100644
  # Override default flag values for local packages and extra-deps
 diff --git test_samples/.gitignore test_samples/.gitignore
 index ecf4dbf..6615403 100644
---- a/test_samples/.gitignore
-+++ b/test_samples/.gitignore
+--- test_samples/.gitignore
++++ test_samples/.gitignore
 @@ -1,3 +1,4 @@
  sample.fq
  sample.sam
@@ -3380,8 +3380,8 @@ index 0000000..131c45d
 +                    output.write("Feature_{}\t0\n".format(f))
 diff --git tests/argv/argv.ngl tests/argv/argv.ngl
 index d9eb178..59cd8d7 100644
---- a/tests/argv/argv.ngl
-+++ b/tests/argv/argv.ngl
+--- tests/argv/argv.ngl
++++ tests/argv/argv.ngl
 @@ -1,3 +1,3 @@
 -ngless "0.0"
 +ngless "0.8"
@@ -3389,8 +3389,8 @@ index d9eb178..59cd8d7 100644
  print("\n")
 diff --git tests/as-reads-3/as_reads.ngl tests/as-reads-3/as_reads.ngl
 index f528e83..05a66a4 100644
---- a/tests/as-reads-3/as_reads.ngl
-+++ b/tests/as-reads-3/as_reads.ngl
+--- tests/as-reads-3/as_reads.ngl
++++ tests/as-reads-3/as_reads.ngl
 @@ -1,4 +1,4 @@
 -ngless '0.7'
 +ngless '0.8'
@@ -3399,8 +3399,8 @@ index f528e83..05a66a4 100644
  
 diff --git tests/as_reads-bam/as_reads.ngl tests/as_reads-bam/as_reads.ngl
 index 7cfbce9..9eb9d3c 100644
---- a/tests/as_reads-bam/as_reads.ngl
-+++ b/tests/as_reads-bam/as_reads.ngl
+--- tests/as_reads-bam/as_reads.ngl
++++ tests/as_reads-bam/as_reads.ngl
 @@ -1,3 +1,3 @@
 -ngless '0.0'
 +ngless '0.8'
@@ -3408,8 +3408,8 @@ index 7cfbce9..9eb9d3c 100644
          ofile='output.fq')
 diff --git tests/as_reads/as_reads.ngl tests/as_reads/as_reads.ngl
 index 7e3a8ed..9b7e90b 100644
---- a/tests/as_reads/as_reads.ngl
-+++ b/tests/as_reads/as_reads.ngl
+--- tests/as_reads/as_reads.ngl
++++ tests/as_reads/as_reads.ngl
 @@ -1,4 +1,4 @@
 -ngless '0.0'
 +ngless '0.8'
@@ -3418,8 +3418,8 @@ index 7e3a8ed..9b7e90b 100644
  reads = as_reads(mapped)
 diff --git tests/as_reads_encoding/as_reads.ngl tests/as_reads_encoding/as_reads.ngl
 index 8c0d7bd..6e3005c 100644
---- a/tests/as_reads_encoding/as_reads.ngl
-+++ b/tests/as_reads_encoding/as_reads.ngl
+--- tests/as_reads_encoding/as_reads.ngl
++++ tests/as_reads_encoding/as_reads.ngl
 @@ -1,4 +1,4 @@
 -ngless "0.0"
 +ngless "0.8"
@@ -3428,8 +3428,8 @@ index 8c0d7bd..6e3005c 100644
      read = substrim(read, min_quality=25)
 diff --git tests/as_reads_regression/as_reads.ngl tests/as_reads_regression/as_reads.ngl
 index 64a0179..0fc342f 100644
---- a/tests/as_reads_regression/as_reads.ngl
-+++ b/tests/as_reads_regression/as_reads.ngl
+--- tests/as_reads_regression/as_reads.ngl
++++ tests/as_reads_regression/as_reads.ngl
 @@ -1,3 +1,3 @@
 -ngless "0.6"
 +ngless "0.8"
@@ -3437,8 +3437,8 @@ index 64a0179..0fc342f 100644
  write(as_reads(samfile('test.sam')), ofile='output.fq')
 diff --git tests/assemble-gp/assemble-gp.ngl tests/assemble-gp/assemble-gp.ngl
 index 4879317..0d6dd33 100644
---- a/tests/assemble-gp/assemble-gp.ngl
-+++ b/tests/assemble-gp/assemble-gp.ngl
+--- tests/assemble-gp/assemble-gp.ngl
++++ tests/assemble-gp/assemble-gp.ngl
 @@ -1,4 +1,4 @@
 -ngless "0.6"
 +ngless "0.8"
@@ -3447,8 +3447,8 @@ index 4879317..0d6dd33 100644
  write(orf_find(assemble(input),
 diff --git tests/assemble/assemble.ngl tests/assemble/assemble.ngl
 index dc873f6..b0ee1a0 100644
---- a/tests/assemble/assemble.ngl
-+++ b/tests/assemble/assemble.ngl
+--- tests/assemble/assemble.ngl
++++ tests/assemble/assemble.ngl
 @@ -1,4 +1,4 @@
 -ngless "0.0"
 +ngless "0.8"
@@ -3457,8 +3457,8 @@ index dc873f6..b0ee1a0 100644
  write(assemble(input), ofile='output.fna')
 diff --git tests/grouped/expected.fqstats.tsv tests/grouped/expected.fqstats.tsv
 index 235f8b2..f0bb791 100644
---- a/tests/grouped/expected.fqstats.tsv
-+++ b/tests/grouped/expected.fqstats.tsv
+--- tests/grouped/expected.fqstats.tsv
++++ tests/grouped/expected.fqstats.tsv
 @@ -6,6 +6,7 @@
  0:minSeqLen	40
  0:maxSeqLen	177
@@ -3482,8 +3482,8 @@ index 235f8b2..f0bb791 100644
 +2:nonATCGFraction	4.4742729306487695e-3
 diff --git tests/grouped/grouped.ngl tests/grouped/grouped.ngl
 index cc62c1d..6d7b91f 100644
---- a/tests/grouped/grouped.ngl
-+++ b/tests/grouped/grouped.ngl
+--- tests/grouped/grouped.ngl
++++ tests/grouped/grouped.ngl
 @@ -1,4 +1,4 @@
 -ngless '0.6'
 +ngless '0.8'
@@ -3564,8 +3564,8 @@ index 0000000..fa6bd8c
 +HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH
 diff --git tests/mapstats/mapstats.ngl tests/mapstats/mapstats.ngl
 index e7f727d..8466da6 100644
---- a/tests/mapstats/mapstats.ngl
-+++ b/tests/mapstats/mapstats.ngl
+--- tests/mapstats/mapstats.ngl
++++ tests/mapstats/mapstats.ngl
 @@ -1,4 +1,4 @@
 -ngless "0.0"
 +ngless "0.8"
@@ -3574,8 +3574,8 @@ index e7f727d..8466da6 100644
  write(mapstats(mapped), ofile="output.txt")
 diff --git tests/merge-sams/merge.ngl tests/merge-sams/merge.ngl
 index 11f7ed0..14b7010 100644
---- a/tests/merge-sams/merge.ngl
-+++ b/tests/merge-sams/merge.ngl
+--- tests/merge-sams/merge.ngl
++++ tests/merge-sams/merge.ngl
 @@ -1,4 +1,4 @@
 -ngless "0.6"
 +ngless "0.8"
@@ -3584,8 +3584,8 @@ index 11f7ed0..14b7010 100644
        ofile='output.merged.sam')
 diff --git tests/mocat_sample_bz2/mocat.ngl tests/mocat_sample_bz2/mocat.ngl
 index 95f15bb..17aa7a5 100644
---- a/tests/mocat_sample_bz2/mocat.ngl
-+++ b/tests/mocat_sample_bz2/mocat.ngl
+--- tests/mocat_sample_bz2/mocat.ngl
++++ tests/mocat_sample_bz2/mocat.ngl
 @@ -1,10 +1,10 @@
 -ngless "0.0"
 +ngless "0.8"
@@ -3601,8 +3601,8 @@ index 95f15bb..17aa7a5 100644
         discard
 diff --git tests/motus/motus.ngl tests/motus/motus.ngl
 index bea076d..fc18f5f 100644
---- a/tests/motus/motus.ngl
-+++ b/tests/motus/motus.ngl
+--- tests/motus/motus.ngl
++++ tests/motus/motus.ngl
 @@ -1,4 +1,4 @@
 -ngless "0.0"
 +ngless "0.8"
@@ -3611,8 +3611,8 @@ index bea076d..fc18f5f 100644
  input = paired('input.1.fq.gz', 'input.2.fq.gz')
 diff --git tests/parallel/ref.fna tests/parallel/ref.fna
 index dce382c..36207dd 100644
---- a/tests/parallel/ref.fna
-+++ b/tests/parallel/ref.fna
+--- tests/parallel/ref.fna
++++ tests/parallel/ref.fna
 @@ -1,8 +1,8 @@
 -> A
 +>A
@@ -3636,8 +3636,8 @@ index dce382c..36207dd 100644
  TTTTCATGTCGTAATGTATATTTTAATGTAGGAGCTGGTGTAGTAATTTAGAGCAATAAATATCACACAGTGAAAATTTATCACAAACTAAATACAGTAACAAAAGAAAGAAAAGCTTATGTACACATTACTGAGGTCTTCACAATAAATTATAGTGTACAGTTCCATCACAGCGTATTTGTATACAAAGCTGGTAATGTGAACACTGAAAGGAATCTCTTATGTAAGTCTTTAATCTTGATTTAATAAAGTTTATACAGTATCAAATAATATCAAAAGTCTAAAAAACACAATGAGTTTTTATATCATGTTTATAAATTATTGTTTCATATACCATAAAAAAATAAGGTCGGATGCGTTGTTACCACTGCTTAGCGGTCAGCAACGATGAAGGTGCAGATGGATCTGATGAGCCAAGGCTAAGCGTACTGTGTTCGCTGAGGATGGTGCTCCAGCTGCTGCTGCCGCCGAGTAATTCATCTTTGTTGTAACAACCCAATACTCATTCTTNTT
 diff --git tests/parse_odd_corners/expression.ngl tests/parse_odd_corners/expression.ngl
 index acd34c1..e9df6b0 100644
---- a/tests/parse_odd_corners/expression.ngl
-+++ b/tests/parse_odd_corners/expression.ngl
+--- tests/parse_odd_corners/expression.ngl
++++ tests/parse_odd_corners/expression.ngl
 @@ -1,8 +1,8 @@
  
  # Ngless used to choke if first line was not "ngless"
@@ -3651,8 +3651,8 @@ index acd34c1..e9df6b0 100644
  print(line0)
 diff --git tests/paste/paste.ngl tests/paste/paste.ngl
 index f3ed343..26e947b 100644
---- a/tests/paste/paste.ngl
-+++ b/tests/paste/paste.ngl
+--- tests/paste/paste.ngl
++++ tests/paste/paste.ngl
 @@ -1,4 +1,4 @@
 -ngless "0.0"
 +ngless "0.8"
@@ -3735,8 +3735,8 @@ index 0000000..b0ea33c
 +    headers=['SAMEA2581908', 'SRX1670084'], ofile='output.txt')
 diff --git tests/preprocess/expected.endstrim.fq tests/preprocess/expected.endstrim.fq
 index af9e28e..b1e2181 100644
---- a/tests/preprocess/expected.endstrim.fq
-+++ b/tests/preprocess/expected.endstrim.fq
+--- tests/preprocess/expected.endstrim.fq
++++ tests/preprocess/expected.endstrim.fq
 @@ -6,3 +6,7 @@ aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
  GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
  +
@@ -3747,8 +3747,8 @@ index af9e28e..b1e2181 100644
 +aaabaa`]baaaaa_aab]a^^`b`aYaW]aba
 diff --git tests/preprocess/expected.endstrim31.fq tests/preprocess/expected.endstrim31.fq
 index e69de29..3f60b15 100644
---- a/tests/preprocess/expected.endstrim31.fq
-+++ b/tests/preprocess/expected.endstrim31.fq
+--- tests/preprocess/expected.endstrim31.fq
++++ tests/preprocess/expected.endstrim31.fq
 @@ -0,0 +1,4 @@
 +@With_High_Quality_Ns
 +GTCAGGACAAGAAAGACAANTCCAATTNACATT
@@ -3756,8 +3756,8 @@ index e69de29..3f60b15 100644
 +aaabaa`]baaaaa_aab]a^^`b`aYaW]aba
 diff --git tests/preprocess/expected.fq tests/preprocess/expected.fq
 index 0cf8f65..edc0685 100644
---- a/tests/preprocess/expected.fq
-+++ b/tests/preprocess/expected.fq
+--- tests/preprocess/expected.fq
++++ tests/preprocess/expected.fq
 @@ -6,3 +6,7 @@ baa`]baaaaa_aab]D^^`b`aYDW]aba
  AACACTACTTAGGCTTATAAGATCNGGTTGCGG
  +
