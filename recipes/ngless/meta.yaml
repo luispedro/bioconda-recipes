@@ -11,8 +11,8 @@ source:
   url: https://github.com/BigDataBiology/ngless/archive/v{{ version }}.tar.gz
   md5: {{ md5 }}
   patches:
-   - Update_ngless.patch
    - wget-no-check-certificat.patch
+   - Update_ngless.patch
 
 build:
   number: 1
