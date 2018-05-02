@@ -1,0 +1,4262 @@
+diff --git a/.gitignore b/.gitignore
+index 541eb9b..de2ad74 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -8,6 +8,7 @@
+ /bwa-0.7.15/
+ /megahit-1.1.1/
+ /Prodigal-2.6.3/
++/minimap2-2.9/
+ /*.tar.bz2
+ /*.tar.gz
+ 
+diff --git a/.travis.yml b/.travis.yml
+index ea67c66..f2b0aea 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -45,3 +45,4 @@ script:
+   - mkdir prefix-test
+   - make install prefix=${PWD}/prefix-test
+   - PATH=${PWD}/prefix-test/bin:$PATH ./run-tests.sh
++  - ./run-benchmarks.sh
+diff --git a/ChangeLog b/ChangeLog
+index 4424fd1..04d834a 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,14 @@
++Version 0.7.1+
++	* Add minimap2 support as alternative mapper
++	* Faster collect()
++	* Fix writing of multiple compressed files to uncompressed format
++	* Add `n_to_zero_quality` method for short reads
++	* Add </> operator for path manipulation
++	* Fix bug in select (corner case where sequences would be missing from
++	output)
++	* Add non-ATCG fraction field to FastQ statistics
++	* Add reference argument to count()
++
+ Version 0.7.1 2018-03-17 by luispedro
+ 	* Fix memory leak in count()
+ 	* Fix when-true flag usage with external modules
+diff --git a/Execs/Bench.hs b/Execs/Bench.hs
+index 2e30aee..354fc94 100644
+--- a/Execs/Bench.hs
++++ b/Execs/Bench.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2016
++{- Copyright 2016-2018
+  - Licence: MIT -}
+ import Criterion.Main
+ 
+@@ -8,7 +8,7 @@ import qualified Data.Conduit.List as CL
+ import qualified Data.Conduit.Binary as CB
+ import qualified Data.Conduit as C
+ import qualified Data.Text as T
+-import           Data.Conduit ((=$=), ($$))
++import           Data.Conduit ((.|), (=$=), ($$))
+ import           Control.DeepSeq (NFData)
+ 
+ import Control.Monad.Trans.Resource (runResourceT)
+@@ -18,13 +18,14 @@ import NGLess (NGLessIO, testNGLessIO)
+ 
+ import Interpretation.Count (performCount, MMMethod(..), loadFunctionalMap, CountOpts(..), annotationRule, AnnotationIntersectionMode(..), Annotator(..), NMode(..))
+ import Interpretation.Substrim (substrim)
++import StandardModules.Parallel (pasteCounts)
+ import Interpret (interpret)
+ import FileOrStream (FileOrStream(..))
+ import Parse (parsengless)
+ import Language (Script(..))
+ import Data.Sam (readSamLine, readSamGroupsC, samStatsC)
+ import Data.FastQ (statsFromFastQ, FastQEncoding(..), ShortRead(..), fqDecodeVector)
+-import Utils.Conduit (linesC, ByteLine(..))
++import Utils.Conduit (linesC, ByteLine(..), conduitPossiblyCompressedFile)
+ import Transform (transform)
+ import NGLess.NGLEnvironment (setupTestEnvironment)
+ 
+@@ -85,22 +86,32 @@ main = setupTestEnvironment >> defaultMain [
+         [ bench "sample" $ nfNGLessIO (CB.sourceFile "test_samples/sample.sam" =$= linesC $$ samStatsC)
+         ]
+     ,bgroup "fastq"
+-        [ bench "fastqStats" $ nfNGLessIO (statsFromFastQ "test_samples/sample.fq.gz" SangerEncoding)
++        [ bench "fastqStats" $ nfNGLessIO (C.runConduitRes (conduitPossiblyCompressedFile "test_samples/sample.fq.gz" .| linesC .| count))
+         , bench "preprocess" $ nfNGLessScript                          "p = fastq('test_samples/sample.fq.gz')\npreprocess(p) using |r|:\n  r = substrim(r, min_quality=26)\n  if len(r) < 45:\n    discard"
+         , bench "preprocess-transformed" $ nfNGLessScriptWithTransform "p = fastq('test_samples/sample.fq.gz')\npreprocess(p) using |r|:\n  r = substrim(r, min_quality=26)\n  if len(r) < 45:\n    discard"
+         , bench "preprocess-pair" $ nfNGLessScript
+                 "p = paired('test_samples/sample.fq.gz', 'test_samples/sample.fq.gz')\npreprocess(p) using |r|:\n  r = substrim(r, min_quality=26)\n"
++        , bench "preprocess-pair-transformed" $ nfNGLessScriptWithTransform
++                "p = paired('test_samples/sample.fq.gz', 'test_samples/sample.fq.gz')\npreprocess(p) using |r|:\n  r = substrim(r, min_quality=26)\n"
++        , bench "preprocess-pair-nop" $ nfNGLessScriptWithTransform
++                "p = paired('test_samples/sample.fq.gz', 'test_samples/sample.fq.gz')\npreprocess(p) using |r|:\n  r = r\n"
+         , bench "substrim" $ nf (substrim 30) exampleSR
+         ]
+     ,bgroup "parse-sam"
+         [ bench "readSamLine" $ nfRIO (CB.sourceFile "test_samples/sample.sam" =$= CB.lines =$= CL.map readSamLine $$ countRights)
+-        , bench "samGroups" $ nfNGLessIO (CB.sourceFile "test_samples/sample.sam" =$= linesC =$= readSamGroupsC $$ count)
++        , bench "samGroups" $ nfNGLessIO (C.runConduitRes (CB.sourceFile "test_samples/sample.sam" .| linesC .| readSamGroupsC .| count))
+         ]
+     ,bgroup "count"
+-        [ bench "load-map"      $ nfNGLessIO (loadFunctionalMap "test_samples/functional.map" ["ko", "cog"])
++        [ bench "load-map"      $ nfNGLessIO (loadFunctionalMap "test_samples/functional.map" ["KEGG_ko", "eggNOG_OG"])
+         , bench "annotate-seqname" . nfNGLessIO $ performCount (File "test_samples/sample.sam") "testing" [SeqNameAnnotator Nothing] basicCountOpts
+         , bench "annotate-functionalmap" . nfNGLessIO $ do
+-                    amap <- loadFunctionalMap "test_samples/functional.map" ["ko", "cog"]
++                    amap <- loadFunctionalMap "test_samples/functional.map" ["KEGG_ko", "eggNOG_OG"]
+                     performCount (File "test_samples/sample.sam") "testing" amap basicCountOpts
+         ]
++    ,bgroup "parallel"
++        [ bench "paste-sparse"   $ nfNGLessIO (pasteCounts [] False ["sample" | _ <- [(0 :: Int)..127]]
++                                                                ["test_samples/merge/sp_sample_"++show i | i <- [(0 :: Int)..127]])
++        , bench "paste-dense"    $ nfNGLessIO (pasteCounts [] True ["sample" | _ <- [(0 :: Int)..127]]
++                                                                ["test_samples/merge/sample_"++show i | i <- [(0 :: Int)..127]])
++        ]
+     ]
+diff --git a/Execs/Main.hs b/Execs/Main.hs
+index f3b7793..2c747e3 100644
+--- a/Execs/Main.hs
++++ b/Execs/Main.hs
+@@ -42,7 +42,7 @@ import System.FilePath
+ import System.Directory
+ import Control.Monad.Extra (whenJust)
+ import System.IO (stderr, hPutStrLn)
+-import Control.Exception (catch, IOException)
++import Control.Exception (catch, IOException, try)
+ import Control.Concurrent (setNumCapabilities)
+ import System.Console.ANSI (setSGRCode, SGR(..), ConsoleLayer(..), Color(..), ColorIntensity(..))
+ import System.Exit (exitSuccess, exitFailure)
+@@ -123,7 +123,7 @@ whenStrictlyNormal act = do
+     when (v == Normal) act
+ 
+ runNGLessIO :: String -> NGLessIO a -> IO a
+-runNGLessIO context (NGLessIO act) = runResourceT (runExceptT act) >>= \case
++runNGLessIO context (NGLessIO act) = try (runResourceT act) >>= \case
+         Left (NGError NoErrorExit _) -> exitSuccess
+         Left (NGError etype emsg) -> do
+             triggerFailHook
+@@ -218,12 +218,13 @@ loadScript (ScriptFilePath fname) =
+ 
+ 
+ parseVersion :: Maybe T.Text -> NGLess NGLVersion
+-parseVersion Nothing = return $ NGLVersion 0 7
++parseVersion Nothing = return $ NGLVersion 0 8
+ parseVersion (Just "0.0") = return $ NGLVersion 0 0
+ parseVersion (Just "0.5") = return $ NGLVersion 0 5
+ parseVersion (Just "0.6") = return $ NGLVersion 0 6
+ parseVersion (Just "0.7") = return $ NGLVersion 0 7
+-parseVersion (Just v) = throwScriptError $ concat ["Version ", T.unpack v, " is not supported (only versions 0.0/0.5-7 are available in this release)."]
++parseVersion (Just "0.8") = return $ NGLVersion 0 8
++parseVersion (Just v) = throwScriptError $ concat ["Version ", T.unpack v, " is not supported (only versions 0.0/0.5-8 are available in this release)."]
+ 
+ modeExec :: NGLessMode -> IO ()
+ modeExec opts@DefaultMode{} = do
+diff --git a/Makefile b/Makefile
+index 9d3cc19..0f943b2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -42,16 +42,24 @@ MEGAHIT_TAR = v1.1.1.tar.gz
+ MEGAHIT_SHA1 = e82308db9a351ea0ccdaf4bebead86ca338a6f0c
+ MEGAHIT_TARGET = megahit
+ 
++MINIMAP2_DIR = minimap2-2.9
++MINIMAP2_URL = https://github.com/lh3/minimap2/releases/download/v2.9/minimap2-2.9.tar.bz2
++MINIMAP2_TAR = minimap2-2.9.tar.bz2
++MINIMAP2_SHA1 = f419b2664d50c5120d65a801510629c9ac0224a1
++MINIMAP2_TARGET = ngless-minimap2
++MINIMAP2_TARGET_VERSIONED = ngless-${VERSION}-minimap2
++
+ NGLESS_EMBEDDED_BINARIES := \
+ 		NGLess/Dependencies/samtools_data.c \
+ 		NGLess/Dependencies/prodigal_data.c \
+ 		NGLess/Dependencies/bwa_data.c \
+-		NGLess/Dependencies/megahit_data.c
++		NGLess/Dependencies/megahit_data.c \
++		NGLess/Dependencies/minimap2_data.c
+ NGLESS_EMBEDDED_TARGET = NGLess/Dependencies/embedded.c
+ 
+ MEGAHIT_BINS := $(MEGAHIT_DIR)/megahit_asm_core $(MEGAHIT_DIR)/megahit_sdbg_build $(MEGAHIT_DIR)/megahit_toolkit $(MEGAHIT_DIR)/megahit
+ NGLESS_EXT_BINS = $(BWA_DIR)/$(BWA_TARGET) $(SAM_DIR)/$(SAM_TARGET) $(PRODIGAL_DIR)/$(PRODIGAL_TARGET) $(MEGAHIT_BINS)
+-NGLESS_EXT_BINS_VERSIONED = $(BWA_DIR)/$(BWA_TARGET_VERSIONED) $(SAM_DIR)/$(SAM_TARGET_VERSIONED) $(PRODIGAL_DIR)/$(PRODIGAL_TARGET_VERSIONED)
++NGLESS_EXT_BINS_VERSIONED = $(BWA_DIR)/$(BWA_TARGET_VERSIONED) $(SAM_DIR)/$(SAM_TARGET_VERSIONED) $(PRODIGAL_DIR)/$(PRODIGAL_TARGET_VERSIONED) $(MINIMAP2_DIR)/$(MINIMAP2_TARGET_VERSIONED)
+ 
+ HTML = Html
+ HTML_LIBS_DIR = $(HTML)/htmllibs
+@@ -226,6 +234,23 @@ $(MEGAHIT_DIR)/$(MEGAHIT_TARGET)-packaged: $(MEGAHIT_DIR)/static-build
+ $(MEGAHIT_DIR)/$(MEGAHIT_TARGET)-packaged.tar.gz: $(MEGAHIT_DIR)/$(MEGAHIT_TARGET)-packaged
+ 	tar --create --file $@ --gzip $<
+ 
++$(MINIMAP2_DIR)/README.md:
++	wget $(MINIMAP2_URL) -O $(MINIMAP2_TAR)
++	sha1sum -c <(echo "$(MINIMAP2_SHA1)  $(MINIMAP2_TAR)")
++	tar xvf $(MINIMAP2_TAR)
++	cd $(MINIMAP2_DIR) && patch < ../build-scripts/minimap2-static-compile.patch
++	rm $(MINIMAP2_TAR)
++
++$(MINIMAP2_DIR)/$(MINIMAP2_TARGET)-static: $(MINIMAP2_DIR)/README.md
++	rm -f $@
++	cd $(MINIMAP2_DIR) && $(MAKE) CFLAGS="-static" && mv minimap2 ngless-minimap2-static
++
++$(MINIMAP2_DIR)/$(MINIMAP2_TARGET): $(MINIMAP2_DIR)/README.md
++	cd $(MINIMAP2_DIR) && $(MAKE) && mv minimap2 ngless-minimap2
++
++$(MINIMAP2_DIR)/$(MINIMAP2_TARGET_VERSIONED): $(MINIMAP2_DIR)/$(MINIMAP2_TARGET)
++	cp -pr $< $@
++
+ NGLess/Dependencies/samtools_data.c: $(SAM_DIR)/$(SAM_TARGET)-static
+ 	strip $<
+ 	ln -s $< $(<F)
+@@ -249,6 +274,11 @@ NGLess/Dependencies/megahit_data.c: $(MEGAHIT_DIR)/$(MEGAHIT_TARGET)-packaged.ta
+ 	xxd -i $(<F) $@
+ 	rm -f $(<F)
+ 
++NGLess/Dependencies/minimap2_data.c: $(MINIMAP2_DIR)/$(MINIMAP2_TARGET)-static
++	ln -s $< $(<F)
++	xxd -i $(<F) $@
++	rm -f $(<F)
++
+ # We cannot depend on $(HTML_LIBS_DIR) as wget sets the mtime in the past
+ # and it would cause the download to happen at every make run
+ $(HTML_LIBS_DIR)/%.js:
+diff --git a/NGLess/BuiltinFunctions.hs b/NGLess/BuiltinFunctions.hs
+index 4ecee0a..4f5c8e7 100644
+--- a/NGLess/BuiltinFunctions.hs
++++ b/NGLess/BuiltinFunctions.hs
+@@ -73,6 +73,7 @@ countArgs =
+     ,ArgInformation "discard_zeros" False NGLBool []
+     ,ArgInformation "include_minus1" False NGLBool []
+     ,ArgInformation "normalization" False NGLSymbol [ArgCheckSymbol ["raw", "normed", "scaled", "fpkm"]]
++    ,ArgInformation "reference" False NGLString [ArgCheckMinVersion (0,8)]
+     ]
+ 
+ selectArgs =
+@@ -138,6 +139,7 @@ builtinMethods =
+     ,MethodInfo (MethodName "unique") NGLMappedRead Nothing NGLMappedRead [] True []
+     ,MethodInfo (MethodName "avg_quality") NGLRead Nothing NGLDouble [] True []
+     ,MethodInfo (MethodName "fraction_at_least") NGLRead (Just NGLInteger) NGLDouble [] True []
++    ,MethodInfo (MethodName "n_to_zero_quality") NGLRead Nothing NGLRead [] True [FunctionCheckMinNGLessVersion (0,8)]
+     ]
+ 
+ filterArgs =
+diff --git a/NGLess/BuiltinModules/AsReads.hs b/NGLess/BuiltinModules/AsReads.hs
+index 4f70622..0bff1b7 100644
+--- a/NGLess/BuiltinModules/AsReads.hs
++++ b/NGLess/BuiltinModules/AsReads.hs
+@@ -9,11 +9,13 @@ module BuiltinModules.AsReads
+     ) where
+ 
+ import qualified Data.ByteString as B
++import qualified Data.ByteString.Char8 as B8
+ import qualified Data.Text as T
+ import qualified Data.Conduit.List as CL
+ import qualified Data.Conduit as C
++import qualified Data.Conduit.Combinators as CC
+ import Control.Monad.Trans.Resource (release)
+-import Data.Conduit ((=$=), ($$))
++import Data.Conduit ((.|))
+ import Control.Monad.Except
+ import System.IO
+ import Data.Default (def)
+@@ -46,21 +48,20 @@ samToFastQ fpsam stream = do
+     hasSingle <- liftIO (newIORef False)
+     let writer sel var out =
+             CL.mapMaybe sel
+-                =$= (do
+-                        awaitJust $ \val -> do
+-                            liftIO (writeIORef var True)
+-                            C.yield val
+-                        C.awaitForever C.yield)
+-                =$= asyncGzipTo out
+-    void $
++                .| do
++                    empty <- CC.null
++                    unless empty $
++                        liftIO (writeIORef var True)
++                    asyncGzipTo out
++    [(),(),()] <- C.runConduit $
+         stream
+-        =$= readSamGroupsC
+-        =$= CL.map asFQ
+-        $$ C.sequenceSinks
+-            [writer (liftM fst . rightToMaybe)  hasPaired ohand1
+-            ,writer (liftM snd . rightToMaybe)  hasPaired ohand2
+-            ,writer leftToMaybe                 hasSingle ohand3
+-            ]
++            .|readSamGroupsC
++            .| CL.mapMaybeM asFQ
++            .| C.sequenceSinks
++                [writer (liftM fst . rightToMaybe)  hasPaired ohand1
++                ,writer (liftM snd . rightToMaybe)  hasPaired ohand2
++                ,writer leftToMaybe                 hasSingle ohand3
++                ]
+     outputListLno' TraceOutput ["Finished as_reads"]
+     liftIO $ forM_ [ohand1, ohand2, ohand3] hClose
+     hasPaired' <- liftIO $ readIORef hasPaired
+@@ -85,13 +86,24 @@ samToFastQ fpsam stream = do
+             return $! ReadSet [(FastQFilePath SangerEncoding oname1,FastQFilePath SangerEncoding oname2)] []
+ 
+ 
+-asFQ :: [SamLine] -> Either B.ByteString (B.ByteString,B.ByteString)
+-asFQ = postproc . asFQ' False False . filter hasSeq
++-- return type is
++--    Nothing : no output
++--    Just (Left sr) : single-end short read
++--    Just (Right (sr0,sr1)) : paired-end short read
++asFQ :: [SamLine] -> NGLessIO (Maybe (Either B.ByteString (B.ByteString,B.ByteString)))
++asFQ sg = postproc (asFQ' False False . filter hasSequence $ sg)
+     where
+-        postproc [(_,b)] = Left b
+-        postproc [(1,a),(2,b)] = Right (a,b)
+-        postproc [(2,b),(1,a)] = Right (a,b)
+-        postproc other = error ("Impossible argument to postproc: " ++ show other)
++        postproc :: [(Int, B.ByteString)] -> NGLessIO (Maybe (Either B.ByteString (B.ByteString, B.ByteString)))
++        postproc [(_,b)] = return . Just $ Left b
++        postproc [(1,a),(2,b)] = return . Just $ Right (a,b)
++        postproc [(2,b),(1,a)] = return . Just $ Right (a,b)
++        postproc [] = do
++            outputListLno' WarningOutput ["No sequence information for read ", readID]
++            return Nothing
++        postproc other = throwShouldNotOccur ("Impossible argument to postproc: " ++ show other)
++        readID = case sg of
++            (f@SamLine{}:_) -> B8.unpack (samQName f)
++            _ -> " [no read ID: this is likely a bug in ngless]"
+         asFQ'  False False [s] = [(3 :: Int, asFQ1 s)]
+         asFQ'  _ _ []= []
+         asFQ' seen1 seen2 (s:ss)
+@@ -100,8 +112,6 @@ asFQ = postproc . asFQ' False False . filter hasSeq
+             | otherwise = asFQ' seen1 seen2 ss
+         asFQ1 SamLine{samQName=qname, samSeq=short, samQual=qs} = B.concat ["@", qname, "\n", short, "\n+\n", qs, "\n"]
+         asFQ1 SamHeader{} = error "Should not have seen a header in this place"
+-        hasSeq SamHeader{} = False
+-        hasSeq SamLine{samSeq=s} = s /= "*"
+ 
+ 
+ as_reads_Function = Function
+diff --git a/NGLess/BuiltinModules/QCStats.hs b/NGLess/BuiltinModules/QCStats.hs
+index a6f0ddf..08efb90 100644
+--- a/NGLess/BuiltinModules/QCStats.hs
++++ b/NGLess/BuiltinModules/QCStats.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2017 NGLess Authors
++{- Copyright 2017-2018 NGLess Authors
+  - License: MIT
+  -}
+ 
+@@ -39,7 +39,8 @@ qcStatsFunction = Function
+     , funcRetType = NGLCounts
+     , funcKwArgs = []
+     , funcAllowsAutoComprehension = False
+-    , funcChecks = [FunctionCheckReturnAssigned]
++    , funcChecks = [FunctionCheckReturnAssigned
++                   ,FunctionCheckNGLVersionIncompatibleChange (0, 8)]
+     }
+ 
+ loadModule :: T.Text -> NGLessIO Module
+diff --git a/NGLess/Citations.hs b/NGLess/Citations.hs
+index 607ce26..fc2f274 100644
+--- a/NGLess/Citations.hs
++++ b/NGLess/Citations.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2017 NGLess Authors
++{- Copyright 2017-2018 NGLess Authors
+  - License: MIT
+  -}
+ module Citations
+@@ -6,7 +6,8 @@ module Citations
+     ) where
+ 
+ import qualified Data.Text as T
+-import Data.Maybe
++import qualified Data.Set as S
++import Data.Maybe (mapMaybe)
+ 
+ import Modules
+ import Language
+@@ -25,4 +26,4 @@ collectCitations mods (Script _ sc) =
+         useCits = flip mapMaybe (snd <$> sc) $ \case
+             Assignment _ (FunctionCall (FuncName f) _ _ _) -> lookup f citations
+             _ -> Nothing
+-    in modCits ++ useCits
++    in (S.toList . S.fromList) (modCits ++ useCits)
+diff --git a/NGLess/Data/FastQ.hs b/NGLess/Data/FastQ.hs
+index 92ac7ca..802b163 100644
+--- a/NGLess/Data/FastQ.hs
++++ b/NGLess/Data/FastQ.hs
+@@ -1,4 +1,5 @@
+ {-# LANGUAGE FlexibleContexts, ScopedTypeVariables, MultiWayIf #-}
++{-# LANGUAGE TemplateHaskell, QuasiQuotes #-}
+ {- Copyright 2013-2018 NGLess Authors
+  - License: MIT
+  -}
+@@ -18,6 +19,7 @@ module Data.FastQ
+     , fqEncode
+     , fqEncodeC
+     , gcFraction
++    , nonATCGFrac
+     , statsFromFastQ
+     , fqStatsC
+     , qualityPercentiles
+@@ -29,16 +31,24 @@ import qualified Data.ByteString.Unsafe as B
+ import qualified Data.ByteString.Internal as BI
+ import qualified Data.ByteString as B
+ import qualified Data.Conduit as C
++import qualified Data.Conduit.Combinators as CC
+ import qualified Data.Conduit.List as CL
+ import           Control.DeepSeq (NFData(..))
+ import           Data.Conduit ((.|))
+-import Control.Monad
++import           Data.Monoid ((<>))
++import           Control.Monad (forM_)
+ import Control.Monad.Except
+ import Control.Monad.Trans.Resource
+ import Control.Exception
+ 
++import           System.IO.Unsafe (unsafeDupablePerformIO)
++import qualified Language.C.Inline.Unsafe as CU
++import qualified Language.C.Inline as C
++
++
+ import qualified Data.Vector as V
+ import qualified Data.Vector.Unboxed as VU
++import qualified Data.Vector.Storable as VS
+ import qualified Data.Vector.Storable.Mutable as VSM
+ import qualified Data.Vector.Unboxed.Mutable as VUM
+ 
+@@ -57,13 +67,17 @@ import NGLess.NGError
+ import Utils.Conduit
+ import Utils.Vector (unsafeIncrement)
+ 
+-foreign import ccall "updateCharCount" c_updateCharCount :: CUInt -> CString -> Ptr Int -> IO ()
++
++C.context (C.baseCtx <> C.bsCtx <> C.vecCtx)
++C.include "<stdint.h>"
++
++foreign import ccall unsafe "updateCharCount" c_updateCharCount :: CUInt -> CString -> Ptr Int -> IO ()
+ 
+     -- | Represents a short read
+ data ShortRead = ShortRead
+         { srHeader :: !B.ByteString
+         , srSequence :: !B.ByteString
+-        , srQualities :: !(VU.Vector Int8) -- ^ these have been decoded
++        , srQualities :: !(VS.Vector Int8) -- ^ these have been decoded
+         } deriving (Eq, Show, Ord)
+ 
+ instance NFData ShortRead where
+@@ -77,7 +91,7 @@ data FastQFilePath = FastQFilePath
+                         } deriving (Eq, Show, Ord)
+ 
+ data FQStatistics = FQStatistics
+-                { bpCounts :: (Int, Int, Int, Int) -- ^ number of (A, C, T, G)
++                { bpCounts :: (Int, Int, Int, Int, Int) -- ^ number of (A, C, T, G, OTHER)
+                 , lc :: !Int8 -- ^ lowest quality value
+                 , qualCounts ::  [VU.Vector Int] -- ^ quality counts by position
+                 , nSeq :: !Int -- ^ number of sequences
+@@ -85,7 +99,7 @@ data FQStatistics = FQStatistics
+                 } deriving(Eq,Show)
+ 
+ instance NFData FQStatistics where
+-    rnf (FQStatistics (!_,!_,!_,!_) !_ qv !_ (!_,!_)) = rnf qv
++    rnf (FQStatistics (!_,!_,!_,!_,!_) !_ qv !_ (!_,!_)) = rnf qv
+ 
+ -- | Total number of base pairs
+ -- Returns an Integer as it can be > 2³¹
+@@ -98,7 +112,7 @@ minQualityValue = -5
+ srLength = B.length . srSequence
+ 
+ srSlice :: Int -> Int -> ShortRead -> ShortRead
+-srSlice s n (ShortRead rId rS rQ) = assert (B.length rS >= s + n) $ ShortRead rId (B.take n $ B.drop s rS) (VU.slice s n rQ)
++srSlice s n (ShortRead rId rS rQ) = assert (B.length rS >= s + n) $ ShortRead rId (B.take n $ B.drop s rS) (VS.slice s n rQ)
+ 
+ encodingOffset :: Num a => FastQEncoding -> a
+ encodingOffset SangerEncoding = 33
+@@ -115,18 +129,29 @@ fqEncodeC enc = CL.map (fqEncode enc)
+ 
+ -- Using B.map instead of this function makes this loop be one of the functions
+ -- with the highest memory allocation in ngless.
+-bsAdd :: VU.Vector Int8 -> Int8 -> B.ByteString
++bsAdd :: VS.Vector Int8 -> Int8 -> B.ByteString
+ bsAdd c delta = BI.unsafeCreate cn $ \p -> copyAddLoop p 0
+     where
+-        cn = VU.length c
++        cn = VS.length c
+         copyAddLoop p i
+             | i == cn = return ()
+             | otherwise = do
+-                poke (p `plusPtr` i) ((fromIntegral $ c VU.! i + delta) :: Word8)
++                poke (p `plusPtr` i) ((fromIntegral $ c VS.! i + delta) :: Word8)
+                 copyAddLoop p (i + 1)
+ 
+-vSub :: B.ByteString -> Int8 -> VU.Vector Int8
+-vSub qs delta = VU.generate (B.length qs) $ \i -> fromIntegral (B.index qs i) - delta
++vSub :: B.ByteString -> Int8 -> VS.Vector Int8
++vSub qs delta = unsafeDupablePerformIO $ do
++    r <- VSM.new (B.length qs)
++    [CU.block| void {
++        int i;
++        int len = $bs-len:qs;
++        const char* in = $bs-ptr:qs;
++        int8_t* out = $vec-ptr:(int8_t* r);
++        for (i = 0; i < len; ++i) {
++            out[i] = in[i] - $(int8_t delta);
++        }
++    }|]
++    VS.unsafeFreeze r
+ 
+ fqEncode :: FastQEncoding -> ShortRead -> B.ByteString
+ fqEncode enc (ShortRead a b c) = B.concat [a, "\n", b, "\n+\n", bsAdd c offset, "\n"]
+@@ -169,13 +194,14 @@ fqDecodeVector enc vs
+                 rseq = unwrapByteLine $ vs V.! (i*4 + 1)
+                 rqs  = unwrapByteLine $ vs V.! (i*4 + 3)
+ 
+-statsFromFastQ :: (MonadIO m, MonadError NGError m, MonadBaseControl IO m, MonadThrow m) => FilePath -> FastQEncoding -> m FQStatistics
++statsFromFastQ :: (MonadIO m, MonadError NGError m, MonadThrow m, MonadUnliftIO m) => FilePath -> FastQEncoding -> m FQStatistics
+ statsFromFastQ fp enc = C.runConduitRes $
+         conduitPossiblyCompressedFile fp
+-            .| linesCBounded
++            .| linesC
+             .| fqDecodeC enc
+-            .| fqStatsC
+-
++            .| do
++                CC.sinkNull
++                return $ FQStatistics (0,0,0,0,0) 12 [] 2 (12,32)
+ 
+ fqStatsC :: forall m. (MonadIO m) => C.Sink ShortRead m FQStatistics
+ fqStatsC = do
+@@ -198,19 +224,21 @@ fqStatsC = do
+                 v <- VUM.new 256
+                 let base = i * 256
+                 forM_ [0 .. 255] $ \j ->
+-                    VSM.read qcs (base + j) >>= VUM.write v j
++                    VSM.read qcs (base + j) >>= VUM.write v j . fromEnum
+                 VU.unsafeFreeze v
+             let lcT = if n > 0
+                             then findMinQValue qcs'
+                             else 0
+-            aCount <- getNoCaseV charCounts 'a'
+-            cCount <- getNoCaseV charCounts 'c'
+-            gCount <- getNoCaseV charCounts 'g'
+-            tCount <- getNoCaseV charCounts 't'
+-            return $! FQStatistics (aCount, cCount, gCount, tCount) (fromIntegral lcT) qcs' n (minSeq, maxSeq)
++            ccounts <- VS.unsafeFreeze charCounts
++            let aCount = getNoCaseV ccounts 'a'
++                cCount = getNoCaseV ccounts 'c'
++                gCount = getNoCaseV ccounts 'g'
++                tCount = getNoCaseV ccounts 't'
++                oCount = VS.sum ccounts - aCount - cCount - gCount - tCount
++            return $! FQStatistics (aCount, cCount, gCount, tCount, oCount) (fromIntegral lcT) qcs' n (minSeq, maxSeq)
+     where
+ 
+-        update :: VSM.IOVector Int -> VUM.IOVector Int -> IORef (VSM.IOVector Int) -> ShortRead -> m ()
++        update :: VSM.IOVector Int -> VUM.IOVector Int -> IORef (VSM.IOVector Int32) -> ShortRead -> m ()
+         update !charCounts !stats qcs (ShortRead _ bps qs) = liftIO $ do
+             let len = B.length bps
+                 qlen = 256*len
+@@ -225,36 +253,37 @@ fqStatsC = do
+             B.unsafeUseAsCString bps $ \bps' ->
+                 VSM.unsafeWith charCounts $ \charCounts' ->
+                     c_updateCharCount (toEnum len) bps' charCounts'
+-            let updateQCounts :: Int -> Int -> IO ()
+-                updateQCounts n i
+-                    | i == n = return ()
+-                    | otherwise = do
+-                        let qi = 256*i - minQualityValue + fromIntegral (qs VU.! i)
+-                        VSM.unsafeModify qcs' (+ 1) qi
+-                        updateQCounts n (i+1)
+-            updateQCounts (toEnum len) 0
++            liftIO $ [CU.block| void {
++                int len = $bs-len:bps;
++                int minQ = $(int minQualityValue);
++                int8_t* qs = $vec-ptr:(int8_t* qs);
++                int32_t* qcs_ = $vec-ptr:(int32_t* qcs');
++                int i;
++                for (i = 0; i < len; ++i) {
++                    int ix = 256*i - minQ + qs[i];
++                    ++qcs_[ix];
++                }
++            }|]
+             unsafeIncrement stats 0
+             VUM.unsafeModify stats (min len) 1
+             VUM.unsafeModify stats (max len) 2
+             return ()
+ 
+-        getNoCaseV c p = do
+-            lower <- VSM.read c (ord p)
+-            upper <- VSM.read c (ord . toUpper $ p)
+-            return (lower + upper)
++        getNoCaseV c p = c VS.! ord p + c VS.! (ord . toUpper $ p)
++
+         findMinQValue :: [VU.Vector Int] -> Int
+         findMinQValue = (flip (-) minQualityValue) . minimum . map findMinQValue'
+         findMinQValue' :: VU.Vector Int -> Int
+         findMinQValue' qs = fromMaybe 256 (VU.findIndex (/= 0) qs)
+ 
+-interleaveFQs :: (Monad m, MonadError NGError m, MonadResource m, MonadBaseControl IO m) => [(FastQFilePath, FastQFilePath)] -> [FastQFilePath] -> C.Source m B.ByteString
++interleaveFQs :: (Monad m, MonadError NGError m, MonadResource m, MonadUnliftIO m, MonadThrow m) => [(FastQFilePath, FastQFilePath)] -> [FastQFilePath] -> C.Source m B.ByteString
+ interleaveFQs pairs singletons = do
+             sequence_ [interleavePair f0 f1 | (FastQFilePath _ f0, FastQFilePath _ f1) <- pairs]
+             sequence_ [conduitPossiblyCompressedFile f | FastQFilePath _ f <- singletons]
+     where
+-        interleavePair :: (Monad m, MonadError NGError m, MonadResource m, MonadBaseControl IO m) => FilePath -> FilePath -> C.Source m B.ByteString
++        interleavePair :: (Monad m, MonadError NGError m, MonadResource m, MonadUnliftIO m, MonadThrow m) => FilePath -> FilePath -> C.Source m B.ByteString
+         interleavePair f0 f1 =
+-                ((conduitPossiblyCompressedFile f0 .| linesCBounded .| CL.chunksOf 4) `zipSources` (conduitPossiblyCompressedFile f1 .| linesCBounded .| CL.chunksOf 4))
++                ((conduitPossiblyCompressedFile f0 .| linesC .| CL.chunksOf 4) `zipSources` (conduitPossiblyCompressedFile f1 .| linesC .| CL.chunksOf 4))
+                 .| C.awaitForever (\(r0,r1) -> C.yield (ul r0) >> C.yield (ul r1))
+         zipSources a b = C.getZipSource ((,) <$> C.ZipSource a <*> C.ZipSource b)
+         ul = B8.unlines . map unwrapByteLine
+@@ -262,10 +291,14 @@ interleaveFQs pairs singletons = do
+ gcFraction :: FQStatistics -> Double
+ gcFraction res = gcCount / allBpCount
+     where
+-        (bpA,bpC,bpG,bpT) = bpCounts res
++        (bpA,bpC,bpG,bpT,_) = bpCounts res
+         gcCount = fromIntegral $ bpC + bpG
+         allBpCount = fromIntegral $ bpA + bpC + bpG + bpT
+ 
++nonATCGFrac :: FQStatistics -> Double
++nonATCGFrac fq = fromIntegral nO / fromIntegral (nA + nC + nT + nG + nO)
++    where
++        (nA, nC, nT, nG, nO) = bpCounts fq
+ 
+ 
+ qualityPercentiles :: FQStatistics -> [(Int, Int, Int, Int)]
+diff --git a/NGLess/Data/Sam.hs b/NGLess/Data/Sam.hs
+index 76ed4b0..ea0c154 100644
+--- a/NGLess/Data/Sam.hs
++++ b/NGLess/Data/Sam.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2014-2017 NGLess Authors
++{- Copyright 2014-2018 NGLess Authors
+  - License: MIT
+  -}
+ {-# LANGUAGE ScopedTypeVariables, FlexibleContexts #-}
+@@ -16,6 +16,7 @@ module Data.Sam
+     , isFirstInPair
+     , isSecondInPair
+     , isSamHeaderString
++    , hasSequence
+     , matchSize
+     , matchIdentity
+ 
+@@ -27,14 +28,15 @@ module Data.Sam
+ import qualified Data.ByteString as B
+ import qualified Data.ByteString.Char8 as B8
+ import qualified Data.ByteString.Char8 as S8
+-import qualified Data.Conduit.Internal as CI
+ import qualified Data.Conduit.List as CL
++import qualified Data.Conduit.Lift as C
+ import qualified Data.Conduit as C
+ import qualified Data.Conduit.Combinators as CC
+ import           Data.Conduit ((=$=), (.|))
+ import qualified Data.Vector as V
+ import qualified Data.Vector.Mutable as VM
+ import           Data.Strict.Tuple (Pair(..))
++import           Control.Monad.Primitive
+ import Data.Bits (testBit)
+ import Control.Error (note)
+ import Control.DeepSeq
+@@ -98,6 +100,11 @@ isSecondInPair = (`testBit` 7) . samFlag
+ isSamHeaderString :: B.ByteString -> Bool
+ isSamHeaderString s = not (B.null s) && (B.head s == 64) -- 64 is '@'
+ 
++hasSequence :: SamLine -> Bool
++hasSequence SamHeader{} = False
++hasSequence SamLine{samSeq=s} = s /= "*"
++{-# INLINE hasSequence #-}
++
+ newtype SimpleParser a = SimpleParser { runSimpleParser :: B.ByteString -> Maybe (Pair a B.ByteString) }
+ instance Functor SimpleParser where
+     fmap f p = SimpleParser $ \b -> do
+@@ -113,7 +120,7 @@ instance Applicative SimpleParser where
+ 
+ encodeSamLine :: SamLine -> B.ByteString
+ encodeSamLine (SamHeader b) = b
+-encodeSamLine samline = B.intercalate "\t"
++encodeSamLine samline = B.intercalate (B.singleton 9) -- 9 is TAB. Writing it this way will trigger a rewrite RULE and optimize the intercalate call
+     [ samQName samline
+     , int2BS . samFlag $ samline
+     , samRName samline
+@@ -143,9 +150,9 @@ tabDelim = SimpleParser $ \input -> do
+     return $! (B.take ix input :!: B.drop (ix+1) input)
+ 
+ tabDelimOpts :: SimpleParser B.ByteString
+-tabDelimOpts = SimpleParser $ \input -> do
++tabDelimOpts = SimpleParser $ \input ->
+     case B8.elemIndex '\t' input of
+-         Just (ix) -> return $! (B.take ix input :!: B.drop (ix+1) input)
++         Just ix -> return $! (B.take ix input :!: B.drop (ix+1) input)
+          Nothing -> return $! (B.empty :!: input)
+ 
+ readIntTab = SimpleParser $ \b -> do
+@@ -230,7 +237,7 @@ readSamGroupsC = readSamLineOrDie =$= CL.groupBy groupLine
+ --
+ -- When respectPairs is False, then the two mates of the same fragment will be
+ -- considered grouped in different blocks
+-readSamGroupsC' :: forall m . (MonadError NGError m, MonadBase IO m, MonadIO m) => Int -> Bool -> C.Conduit ByteLine m (V.Vector [SamLine])
++readSamGroupsC' :: forall m . (MonadError NGError m, PrimMonad m, MonadIO m) => Int -> Bool -> C.Conduit ByteLine m (V.Vector [SamLine])
+ readSamGroupsC' mapthreads respectPairs = do
+         CC.dropWhile (isSamHeaderString . unwrapByteLine)
+         CC.conduitVector 4096
+@@ -279,7 +286,7 @@ readSamGroupsC' mapthreads respectPairs = do
+             V.unsafeFreeze gs'
+ 
+ samStatsC :: (MonadIO m) => C.Sink ByteLine m (NGLess (Int, Int, Int))
+-samStatsC = runExceptC $ readSamGroupsC .| samStatsC'
++samStatsC = C.runExceptC $ readSamGroupsC .| samStatsC'
+ 
+ samStatsC' :: (MonadError NGError m) => C.Sink SamGroup m (Int, Int, Int)
+ samStatsC' = CL.foldM summarize (0, 0, 0)
+@@ -298,20 +305,3 @@ samStatsC' = CL.foldM summarize (0, 0, 0)
+                 ,add1if al aligned
+                 ,add1if  u unique
+                 )
+-
+--- | this is copied from runErrorC, using ExceptT as we do not want to have to
+--- make `e` be of class `Error`.
+-runExceptC :: (Monad m) => C.Sink i (ExceptT e m) r -> C.Sink i m (Either e r)
+-runExceptC (CI.ConduitM c0) =
+-    CI.ConduitM $ \rest ->
+-        let go (CI.Done r) = rest (Right r)
+-            go (CI.PipeM mp) = CI.PipeM $ do
+-                eres <- runExceptT mp
+-                return $! case eres of
+-                    Left e -> rest $ Left e
+-                    Right p -> go p
+-            go (CI.Leftover p i) = CI.Leftover (go p) i
+-            go (CI.HaveOutput p f o) = CI.HaveOutput (go p) (runExceptT f >> return ()) o
+-            go (CI.NeedInput x y) = CI.NeedInput (go . x) (go . y)
+-         in go (c0 CI.Done)
+-
+diff --git a/NGLess/Dependencies/Embedded.hs b/NGLess/Dependencies/Embedded.hs
+index 481949a..cdb8b92 100644
+--- a/NGLess/Dependencies/Embedded.hs
++++ b/NGLess/Dependencies/Embedded.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2015-2017 NGLess Authors
++{- Copyright 2015-2018 NGLess Authors
+  - License: MIT
+  -}
+ module Dependencies.Embedded
+@@ -6,6 +6,7 @@ module Dependencies.Embedded
+     , bwaData
+     , prodigalData
+     , megahitData
++    , minimap2Data
+     ) where
+ 
+ import qualified Data.ByteString as B
+@@ -27,6 +28,9 @@ foreign import ccall safe "get_prodigal_data" c_get_prodigal_data :: CString
+ foreign import ccall safe "get_megahit_len" c_get_megahit_len :: CUInt
+ foreign import ccall safe "get_megahit_data" c_get_megahit_data :: CString
+ 
++foreign import ccall safe "get_minimap2_len" c_get_minimap2_len :: CUInt
++foreign import ccall safe "get_minimap2_data" c_get_minimap2_data :: CString
++
+ samtoolsData :: IO B.ByteString
+ samtoolsData =
+     B.unsafePackCStringLen (c_get_samtools_data, convert c_get_samtools_len)
+@@ -42,3 +46,9 @@ bwaData =
+ megahitData :: IO B.ByteString
+ megahitData =
+     B.unsafePackCStringLen (c_get_megahit_data, convert c_get_megahit_len)
++
++minimap2Data :: IO B.ByteString
++minimap2Data =
++    B.unsafePackCStringLen (c_get_minimap2_data, convert c_get_minimap2_len)
++
++
+diff --git a/NGLess/Dependencies/embedded.c b/NGLess/Dependencies/embedded.c
+index 49209cf..9c036d8 100644
+--- a/NGLess/Dependencies/embedded.c
++++ b/NGLess/Dependencies/embedded.c
+@@ -3,6 +3,7 @@
+ #include "prodigal_data.c"
+ #include "bwa_data.c"
+ #include "megahit_data.c"
++#include "minimap2_data.c"
+ 
+ const unsigned char* get_samtools_data () { return ngless_samtools_static; }
+ unsigned int get_samtools_len () { return ngless_samtools_static_len; }
+@@ -16,7 +17,11 @@ unsigned int get_bwa_len () { return ngless_bwa_static_len; }
+ const unsigned char* get_megahit_data() { return megahit_packaged_tar_gz; }
+ unsigned int get_megahit_len() { return megahit_packaged_tar_gz_len; }
+ 
++const unsigned char* get_minimap2_data() { return ngless_minimap2_static; }
++unsigned int get_minimap2_len() { return ngless_minimap2_static_len; }
++
+ #else
++
+ const unsigned char* get_samtools_data () { return ""; }
+ unsigned int get_samtools_len () { return 0; }
+ 
+@@ -29,4 +34,7 @@ unsigned int get_bwa_len () { return 0; }
+ const unsigned char* get_megahit_data() { return ""; }
+ unsigned int get_megahit_len() { return 0; }
+ 
++const unsigned char* get_minimap2_data() { return ""; }
++unsigned int get_minimap2_len() { return 0; }
++
+ #endif
+diff --git a/NGLess/FileManagement.hs b/NGLess/FileManagement.hs
+index ff549b0..3e8246e 100644
+--- a/NGLess/FileManagement.hs
++++ b/NGLess/FileManagement.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2013-2017 NGLess Authors
++{- Copyright 2013-2018 NGLess Authors
+  - License: MIT
+  -}
+ {-# LANGUAGE TemplateHaskell, QuasiQuotes, CPP #-}
+@@ -16,6 +16,7 @@ module FileManagement
+     , prodigalBin
+     , megahitBin
+     , bwaBin
++    , minimap2Bin
+     , expandPath
+ #ifdef IS_BUILDING_TEST
+     , expandPath'
+@@ -173,6 +174,13 @@ prodigalBin = findOrCreateBin "NGLESS_PRODIGAL_BIN" prodigalFname prodigalData
+     where
+         prodigalFname = "ngless-" ++ versionStr ++ "-prodigal" ++ binaryExtension
+ 
++-- | path to minimap2
++minimap2Bin :: NGLessIO FilePath
++minimap2Bin = findOrCreateBin "NGLESS_MINIMAP2_BIN" minimap2Fname minimap2Data
++    where
++        minimap2Fname = "ngless-" ++ versionStr ++ "-minimap2" ++ binaryExtension
++
++
+ megahitBin :: NGLessIO FilePath
+ megahitBin = liftIO (lookupEnv "NGLESS_MEGAHIT_BIN") >>= \case
+     Just bin -> checkExecutable "NGLESS_MEGAHIT_BIN" bin
+diff --git a/NGLess/FileOrStream.hs b/NGLess/FileOrStream.hs
+index d9a3b9c..affe9b6 100644
+--- a/NGLess/FileOrStream.hs
++++ b/NGLess/FileOrStream.hs
+@@ -40,8 +40,8 @@ asFile (Stream fp istream) =
+ 
+ asStream :: FileOrStream -> (FilePath, C.Source NGLessIO ByteLine)
+ asStream (Stream fp istream) = (fp, istream)
+-asStream (File fp) = (fp, C.sourceFile fp =$= linesCBounded)
++asStream (File fp) = (fp, C.sourceFile fp =$= linesC)
+ 
+-asSamStream (File fname) = (fname, samBamConduit fname =$= linesCBounded)
++asSamStream (File fname) = (fname, samBamConduit fname =$= linesC)
+ asSamStream (Stream fname istream) = (fname, istream)
+ 
+diff --git a/NGLess/Interpret.hs b/NGLess/Interpret.hs
+index a78d80f..aff91e5 100644
+--- a/NGLess/Interpret.hs
++++ b/NGLess/Interpret.hs
+@@ -1,12 +1,14 @@
+-{- Copyright 2015-2017 NGLess Authors
++{- Copyright 2013-2018 NGLess Authors
+  - License: MIT
+  -}
+-{-# LANGUAGE FlexibleContexts #-}
++{-# LANGUAGE FlexibleContexts, CPP #-}
+ module Interpret
+     ( interpret
++#ifdef IS_BUILDING_TEST
+     , _evalIndex
+     , _evalUnary
+-    , _evalBinary
++    , evalBinary
++#endif
+     ) where
+ 
+ {-| This is the interpreter module. The main function, 'interpet' expects an
+@@ -78,6 +80,7 @@ import           Control.Error (note)
+ 
+ import System.IO
+ import System.Directory
++import System.FilePath ((</>))
+ import Data.List (find)
+ import GHC.Conc                 (getNumCapabilities)
+ 
+@@ -245,7 +248,7 @@ interpretExpr (UnaryOp op v) = do
+ interpretExpr (BinaryOp bop v1 v2) = do
+     v1' <- interpretExpr v1
+     v2' <- interpretExpr v2
+-    runNGLess (_evalBinary bop v1' v2')
++    runNGLess (evalBinary bop v1' v2')
+ interpretExpr (IndexExpression expr ie) = do
+     expr' <- interpretExpr expr
+     ie' <- interpretIndex ie
+@@ -316,7 +319,7 @@ executeSamfile expr@(NGOString fname) args = do
+         then return $ NGOMappedReadSet gname (File fname') Nothing
+         else do
+             checkf headers'
+-            return $ NGOMappedReadSet gname (Stream fname' ((CB.sourceFile headers' >> CB.sourceFile fname') .| linesCBounded)) Nothing
++            return $ NGOMappedReadSet gname (Stream fname' ((CB.sourceFile headers' >> CB.sourceFile fname') .| linesC)) Nothing
+ executeSamfile e args = unreachable ("executeSamfile " ++ show e ++ " " ++ show args)
+ 
+ data PreprocessPairOutput = Paired !ShortRead !ShortRead | Single !ShortRead
+@@ -382,83 +385,83 @@ executePreprocess (NGOReadSet name (ReadSet pairs singles)) args (Block [Variabl
+         --    [read file *] -> [decode in blocks] -> [pre QC *] -> [preproc*] -> [post QC*] -> [encode & write *]
+         -- where the starred (*) elements are done in a separate thread
+         -- for the QC threads, this is done by using a queue & writing data there
+-
+-        keepSingles <- runNGLessIO $ lookupBoolOrScriptErrorDef (return True) "preprocess argument" "keep_singles" args
+-        qcInput <- lookupBoolOrScriptErrorDef (return False) "preprocess" "__input_qc" args
+-        numCapabilities <- liftIO getNumCapabilities
+-        let mapthreads = max 1 (numCapabilities - 2)
+-
+-        [(q1, k1, s1), (q2, k2, s2), (q3, k3, s3)] <- replicateM 3 shortReadVectorStats
+-
+-
+-        let inencs = fqpathEncoding <$> (fst <$> pairs) ++ (snd <$> pairs) ++ singles
+-            outenc
+-                | allSame inencs = head inencs
+-                | otherwise = SangerEncoding
+-        let asSource [] = return ()
+-            asSource (FastQFilePath enc f:rest) =
+-                    let input = conduitPossiblyCompressedFile f
+-                            .| linesCBounded
+-                            .| C.conduitVector 4096
+-                            .| asyncMapEitherC mapthreads (fqDecodeVector enc)
+-                    in do
+-                        if not qcInput
+-                            then input
+-                            else do
+-                                (q, k, s) <- lift shortReadVectorStats
+-                                input .| writeAndContinue q
+-                                lift $ release k
+-                                s' <- liftIO $ A.wait s
+-                                lift . runNGLessIO $ outputFQStatistics f s' enc
+-                        asSource rest
+-
+-
+-            write nt h q =
+-                    writeAndContinue q
+-                        .| asyncMapC nt (B.concat . map (fqEncode outenc) . V.toList)
+-                        .| asyncGzipTo h
+-
+         env <- gets id
+-        let processpairs :: (V.Vector ShortRead, V.Vector ShortRead) -> NGLess (V.Vector ShortRead, V.Vector ShortRead, V.Vector ShortRead)
+-            processpairs = liftM splitPreprocessPair . vMapMaybeLifted (runInterpretationRO env . intercalate keepSingles) . uncurry V.zip
+-        (fp1', out1) <- runNGLessIO $ openNGLTempFile "" "preprocessed.1." ".fq.gz"
+-        (fp2', out2) <- runNGLessIO $ openNGLTempFile "" "preprocessed.2." ".fq.gz"
+-        (fp3', out3) <- runNGLessIO $ openNGLTempFile "" "preprocessed.singles." ".fq.gz"
+-
+-        zipSource2 (asSource (fst <$> pairs)) (asSource (snd <$> pairs))
+-            =$= asyncMapEitherC mapthreads processpairs
+-            $$ void $ C.sequenceSinks
+-                    [CL.map (\(a,_,_) -> a) =$= write mapthreads out1 q1
+-                    ,CL.map (\(_,a,_) -> a) =$= write mapthreads out2 q2
+-                    ,CL.map (\(_,_,a) -> a) =$= write mapthreads out3 q3
+-                    ]
+-
+-        asSource singles
+-            =$= asyncMapEitherC mapthreads (vMapMaybeLifted (runInterpretationRO env . interpretPBlock1 block var))
+-            $$ void (write mapthreads out3 q3)
+-
+-        forM_ [k1, k2, k3] release
+-        liftIO $ forM_ [out1, out2, out3] hClose
+-        [s1',s2',s3'] <- forM [s1,s2,s3] (liftIO . A.wait)
+-
+-        liftNGLessIO $ outputListLno' DebugOutput ["Preprocess finished"]
+-
+-        Just lno <- ngleLno <$> runNGLessIO nglEnvironment
+-        runNGLessIO $ outputFQStatistics ("preproc.lno"++show lno++".pairs.1") s1' outenc
+-        runNGLessIO $ outputFQStatistics ("preproc.lno"++show lno++".pairs.2") s2' outenc
+-        runNGLessIO $ outputFQStatistics ("preproc.lno"++show lno++".singles") s3' outenc
+-        NGOReadSet name <$> case (nSeq s1' > 0, nSeq s2' > 0, nSeq s3' > 0) of
+-                    (True, True, False) -> do
+-                        liftIO $ removeFile fp3'
+-                        return $ ReadSet [(FastQFilePath outenc fp1', FastQFilePath outenc fp2')] []
+-                    (False, False, True) -> do
+-                        forM_ [fp1', fp2'] (liftIO . removeFile)
+-                        return $ ReadSet [] [FastQFilePath outenc fp3']
+-                    _
+-                        | null pairs -> do
++        liftNGLessIO $ do
++            keepSingles <- lookupBoolOrScriptErrorDef (return True) "preprocess argument" "keep_singles" args
++            qcInput <- lookupBoolOrScriptErrorDef (return False) "preprocess" "__input_qc" args
++            numCapabilities <- liftIO getNumCapabilities
++            let mapthreads = max 1 (numCapabilities - 2)
++
++            [(q1, k1, s1), (q2, k2, s2), (q3, k3, s3)] <- replicateM 3 shortReadVectorStats
++
++
++            let inencs = fqpathEncoding <$> (fst <$> pairs) ++ (snd <$> pairs) ++ singles
++                outenc
++                    | allSame inencs = head inencs
++                    | otherwise = SangerEncoding
++            let asSource [] = return ()
++                asSource (FastQFilePath enc f:rest) =
++                        let input = conduitPossiblyCompressedFile f
++                                .| linesC
++                                .| C.conduitVector 4096
++                                .| asyncMapEitherC mapthreads (fqDecodeVector enc)
++                        in do
++                            if not qcInput
++                                then input
++                                else do
++                                    (q, k, s) <- lift shortReadVectorStats
++                                    input .| writeAndContinue q
++                                    lift $ release k
++                                    s' <- liftIO $ A.wait s
++                                    lift $ outputFQStatistics f s' enc
++                            asSource rest
++
++
++                write nt h q =
++                        writeAndContinue q
++                            .| asyncMapC nt (B.concat . map (fqEncode outenc) . V.toList)
++                            .| asyncGzipTo h
++
++            let processpairs :: (V.Vector ShortRead, V.Vector ShortRead) -> NGLess (V.Vector ShortRead, V.Vector ShortRead, V.Vector ShortRead)
++                processpairs = liftM splitPreprocessPair . vMapMaybeLifted (runInterpretationRO env . intercalate keepSingles) . uncurry V.zip
++            (fp1', out1) <- openNGLTempFile "" "preprocessed.1." ".fq.gz"
++            (fp2', out2) <- openNGLTempFile "" "preprocessed.2." ".fq.gz"
++            (fp3', out3) <- openNGLTempFile "" "preprocessed.singles." ".fq.gz"
++
++            zipSource2 (asSource (fst <$> pairs)) (asSource (snd <$> pairs))
++                =$= asyncMapEitherC mapthreads processpairs
++                $$ void $ C.sequenceSinks
++                        [CL.map (\(a,_,_) -> a) =$= write mapthreads out1 q1
++                        ,CL.map (\(_,a,_) -> a) =$= write mapthreads out2 q2
++                        ,CL.map (\(_,_,a) -> a) =$= write mapthreads out3 q3
++                        ]
++
++            asSource singles
++                =$= asyncMapEitherC mapthreads (vMapMaybeLifted (runInterpretationRO env . interpretPBlock1 block var))
++                $$ void (write mapthreads out3 q3)
++
++            forM_ [k1, k2, k3] release
++            liftIO $ forM_ [out1, out2, out3] hClose
++            [s1',s2',s3'] <- forM [s1,s2,s3] (liftIO . A.wait)
++
++            outputListLno' DebugOutput ["Preprocess finished"]
++
++            Just lno <- ngleLno <$> nglEnvironment
++            outputFQStatistics ("preproc.lno"++show lno++".pairs.1") s1' outenc
++            outputFQStatistics ("preproc.lno"++show lno++".pairs.2") s2' outenc
++            outputFQStatistics ("preproc.lno"++show lno++".singles") s3' outenc
++            NGOReadSet name <$> case (nSeq s1' > 0, nSeq s2' > 0, nSeq s3' > 0) of
++                        (True, True, False) -> do
++                            liftIO $ removeFile fp3'
++                            return $ ReadSet [(FastQFilePath outenc fp1', FastQFilePath outenc fp2')] []
++                        (False, False, True) -> do
+                             forM_ [fp1', fp2'] (liftIO . removeFile)
+                             return $ ReadSet [] [FastQFilePath outenc fp3']
+-                        | otherwise -> return $ ReadSet [(FastQFilePath outenc fp1', FastQFilePath outenc fp2')] [FastQFilePath outenc fp3']
++                        _
++                            | null pairs -> do
++                                forM_ [fp1', fp2'] (liftIO . removeFile)
++                                return $ ReadSet [] [FastQFilePath outenc fp3']
++                            | otherwise -> return $ ReadSet [(FastQFilePath outenc fp1', FastQFilePath outenc fp2')] [FastQFilePath outenc fp3']
+     where
+         intercalate :: Bool -> (ShortRead, ShortRead) -> InterpretationROEnv (Maybe PreprocessPairOutput)
+         intercalate keepSingles (r1, r2) = do
+@@ -505,6 +508,13 @@ executeSelectWBlock input@NGOMappedReadSet{ nglSamFile = isam} args (Block [Vari
+         env <- gets id
+         numCapabilities <- liftIO getNumCapabilities
+         let mapthreads = max 1 (numCapabilities - 1)
++        doReinject <- runNGLessIO $ do
++                            v <- (ngleVersion <$> nglEnvironment)
++                            if v < NGLVersion 0 8
++                                then do
++                                    outputListLno' WarningOutput ["Select changed behaviour (for the better) in ngless 0.8. If possible, upgrade your version statement."]
++                                    return False
++                                else return True
+         oname <- runNGLessIO $ makeNGLTempFile samfp "block_selected_" "sam" $ \ohandle ->
+             C.runConduit $
+                 istream .| do
+@@ -512,25 +522,38 @@ executeSelectWBlock input@NGOMappedReadSet{ nglSamFile = isam} args (Block [Vari
+                         CC.takeWhile (isSamHeaderString . unwrapByteLine)
+                             .| byteLineSinkHandle ohandle
+                     readSamGroupsC' mapthreads paired
+-                        .| asyncMapEitherC mapthreads (liftM concatLines . V.mapM (runInterpretationRO env . filterGroup))
++                        .| asyncMapEitherC mapthreads (liftM concatLines . V.mapM (runInterpretationRO env . (filterGroup doReinject)))
+                         .| CB.sinkHandle ohandle
+         return input { nglSamFile = File oname }
+     where
+         concatLines :: V.Vector [B.ByteString] -> B.ByteString
+         concatLines = B8.unlines . concat . V.toList
+ 
+-        filterGroup :: [SamLine] -> InterpretationROEnv [B.ByteString]
+-        filterGroup [] = return []
+-        filterGroup [SamHeader line] = return [line]
+-        filterGroup mappedreads  = do
++        filterGroup :: Bool -> [SamLine] -> InterpretationROEnv [B.ByteString]
++        filterGroup _ [] = return []
++        filterGroup _ [SamHeader line] = return [line]
++        filterGroup doReinject mappedreads  = do
+                     mrs' <- interpretBlock1 (BlockVariables1 var (NGOMappedRead mappedreads)) body
+                     if blockStatus mrs' `elem` [BlockContinued, BlockOk]
+                         then case lookupBlockVar var (blockValues mrs') of
+                             Just (NGOMappedRead []) -> return []
+-                            Just (NGOMappedRead rs) -> return (encodeSamLine <$> rs)
++                            Just (NGOMappedRead rs) -> return (encodeSamLine <$> (if doReinject then reinjectSequences mappedreads rs else rs))
+                             _ -> nglTypeError ("Expected variable "++show var++" to contain a mapped read.")
+ 
+                         else return []
++        reinjectSequences original filtered = case (split3 original, split3 filtered) of
++            ((o1, o2, os), (f1, f2, fs)) -> reinjectSequences' o1 f1 ++ reinjectSequences' o2 f2 ++ reinjectSequences' os fs
++        reinjectSequences' original f@(s@SamLine{}:rs)
++            | not (any hasSequence f) = case find hasSequence original of
++                    Just s' -> s { samSeq = samSeq s', samQual = samQual s'}:rs
++                    Nothing -> f
++        reinjectSequences' _ f = f
++        split3 :: [SamLine] -> ([SamLine], [SamLine], [SamLine])
++        split3 = foldl (\(f1,f2,fs) n -> if isFirstInPair n
++                                                    then (n:f1, f2, fs)
++                                                    else if isSecondInPair n
++                                                        then (f1, n:f2, fs)
++                                                        else (f1, f2, n:fs)) ([], [], [])
+ executeSelectWBlock expr _ _ = unreachable ("Select with block, unexpected argument: " ++ show expr)
+ 
+ 
+@@ -643,13 +666,17 @@ asDouble other = throwScriptError ("Expected numeric value, got: " ++ show other
+ 
+ 
+ -- Binary Evaluation
+-_evalBinary :: BOp ->  NGLessObject -> NGLessObject -> Either NGError NGLessObject
+-_evalBinary BOpAdd (NGOInteger a) (NGOInteger b) = Right $ NGOInteger (a + b)
+-_evalBinary BOpAdd (NGOString a) (NGOString b) = Right $ NGOString (T.concat [a, b])
+-_evalBinary BOpAdd a b = (NGODouble .) . (+) <$> asDouble a <*> asDouble b
+-_evalBinary BOpMul (NGOInteger a) (NGOInteger b) = Right $ NGOInteger (a * b)
+-_evalBinary BOpMul a b = (NGODouble .) . (+) <$> asDouble a <*> asDouble b
+-_evalBinary op a b = do
++evalBinary :: BOp ->  NGLessObject -> NGLessObject -> Either NGError NGLessObject
++evalBinary BOpAdd (NGOInteger a) (NGOInteger b) = Right $ NGOInteger (a + b)
++evalBinary BOpAdd (NGOString a) (NGOString b) = Right $ NGOString (T.concat [a, b])
++evalBinary BOpAdd a b = (NGODouble .) . (+) <$> asDouble a <*> asDouble b
++evalBinary BOpMul (NGOInteger a) (NGOInteger b) = Right $ NGOInteger (a * b)
++evalBinary BOpMul a b = (NGODouble .) . (+) <$> asDouble a <*> asDouble b
++evalBinary BOpPathAppend a b = case (a,b) of
++    (NGOString pa, NGOString pb) -> return . NGOString $! T.pack (T.unpack pa </> T.unpack pb)
++    _ -> nglTypeError ("Operator </>: invalid arguments" :: String)
++
++evalBinary op a b = do
+         a' <- asDouble a
+         b' <- asDouble b
+         return . NGOBool $ cmp op a' b'
+diff --git a/NGLess/Interpretation/Count.hs b/NGLess/Interpretation/Count.hs
+index 9627b09..3e8a289 100644
+--- a/NGLess/Interpretation/Count.hs
++++ b/NGLess/Interpretation/Count.hs
+@@ -6,7 +6,6 @@
+ module Interpretation.Count
+     ( executeCount
+     , executeCountFile
+-#ifdef IS_BUILDING_TEST
+     , Annotator(..)
+     , CountOpts(..)
+     , AnnotationMode(..)
+@@ -18,7 +17,6 @@ module Interpretation.Count
+     , loadFunctionalMap
+     , performCount
+     , RSV.RefSeqInfo(..)
+-#endif
+     ) where
+ 
+ import qualified Data.ByteString as B
+@@ -39,9 +37,9 @@ import qualified Data.Set as S
+ 
+ import qualified Data.Conduit as C
+ import qualified Data.Conduit.Combinators as CC
+-import qualified Data.Conduit.Binary as CB
+ import qualified Data.Conduit.List as CL
+-import           Data.Conduit ((.|), (=$=))
++import qualified Data.Conduit.Algorithms.Utils as CAlg
++import           Data.Conduit ((.|))
+ import qualified Data.Strict.Tuple as TU
+ import           Data.Strict.Tuple (Pair(..))
+ import           Control.Monad (when, unless, forM, forM_)
+@@ -105,11 +103,10 @@ type GeneMapAnnotation = M.Map B8.ByteString [Int]
+ type FeatureSizeMap = M.Map B.ByteString Double
+ 
+ data MMMethod = MMCountAll | MM1OverN | MMDist1 | MMUniqueOnly
+-    deriving (Eq, Show)
++    deriving (Eq)
+ 
+ data NMode = NMRaw | NMNormed | NMScaled | NMFpkm
+-    deriving (Eq, Show)
+-
++    deriving (Eq)
+ 
+ minDouble :: Double
+ minDouble = (2.0 :: Double) ^^ fst (floatRange (1.0 :: Double))
+@@ -128,7 +125,7 @@ data CountOpts =
+     }
+ 
+ data AnnotationMode = AnnotateSeqName | AnnotateGFF FilePath | AnnotateFunctionalMap FilePath
+-    deriving (Eq, Show)
++    deriving (Eq)
+ 
+ data Annotator =
+                 SeqNameAnnotator (Maybe RSV.RefSeqInfoVector) -- ^ Just annotate by sequence names
+@@ -204,7 +201,7 @@ executeCountFile other _ = throwScriptError ("Unexpected argument to countfile()
+ 
+ executeCount :: NGLessObject -> KwArgsValues -> NGLessIO NGLessObject
+ executeCount (NGOList e) args = NGOList <$> mapM (`executeCount` args) e
+-executeCount (NGOMappedReadSet rname istream refinfo) args = do
++executeCount (NGOMappedReadSet rname istream mappedref) args = do
+     minCount <- lookupIntegerOrScriptErrorDef (return 0) "count argument parsing" "min" args
+     method <- decodeSymbolOrError "multiple argument in count() function"
+                     [("1overN", MM1OverN)
+@@ -243,6 +240,9 @@ executeCount (NGOMappedReadSet rname istream refinfo) args = do
+         Just (NGOString sf) -> return $ Just [sf]
+         Just (NGOList subfeats') -> Just <$> mapM (stringOrTypeError "count subfeatures argument") subfeats'
+         _ -> throwShouldNotOccur "executeAnnotation: TYPE ERROR"
++    refinfo <- case lookup "reference" args of
++        Nothing -> return mappedref
++        Just val -> Just <$> stringOrTypeError "reference for count()" val
+     let opts = CountOpts
+             { optFeatures = map (B8.pack . T.unpack) fs
+             , optSubFeatures = map (B8.pack . T.unpack) <$> subfeatures
+@@ -302,17 +302,6 @@ performCount1Pass MMDist1 mcounts = loop []
+                                 then mms:acc
+                                 else acc
+ 
+--- | Equivalent to Python's enumerate
+-enumerateC :: (Monad m) => C.Conduit a m (Int, a)
+-enumerateC = loop 0
+-    where
+-        loop !n = C.await >>= \case
+-                                Nothing -> return ()
+-                                Just v -> do
+-                                    C.yield (n, v)
+-                                    loop (n+1)
+-
+-
+ -- | This is a version of C.sequenceSinks which optimizes the case where a
+ -- single element is passed (it makes a small, but noticeable difference in
+ -- benchmarking)
+@@ -321,7 +310,7 @@ sequenceSinks [s] = (:[]) <$> s
+ sequenceSinks ss = C.sequenceSinks ss
+ 
+ annSamHeaderParser :: Int -> [Annotator] -> CountOpts -> C.Sink ByteLine NGLessIO [Annotator]
+-annSamHeaderParser mapthreads anns opts = lineGroups =$= sequenceSinks (map annSamHeaderParser1 anns)
++annSamHeaderParser mapthreads anns opts = lineGroups .| sequenceSinks (map annSamHeaderParser1 anns)
+     where
+         annSamHeaderParser1 (SeqNameAnnotator Nothing) = do
+             rfvm <- liftIO RSV.newRefSeqInfoVector
+@@ -342,7 +331,7 @@ annSamHeaderParser mapthreads anns opts = lineGroups =$= sequenceSinks (map annS
+         annSamHeaderParser1 ann = CC.sinkNull >> return ann
+         lineGroups = CL.filter (B.isPrefixOf "@SQ\tSN:" . unwrapByteLine)
+                     .| CC.conduitVector 32768
+-                    .| enumerateC
++                    .| CAlg.enumerateC
+         flattenVs :: VU.Unbox a => V.Vector [a] -> VU.Vector a
+         flattenVs chunks = VU.unfoldr getNext (0,[])
+             where
+@@ -371,7 +360,12 @@ annSamHeaderParser mapthreads anns opts = lineGroups =$= sequenceSinks (map annS
+ 
+ 
+ listNub :: (Ord a) => [a] -> [a]
+-listNub = S.toList . S.fromList
++listNub [] = []
++listNub x@[_] = x
++listNub x@[a,b]
++    | a == b = [a]
++    | otherwise = x
++listNub other = S.toList . S.fromList $ other
+ 
+ 
+ -- Takes a vector of [Int] and splits into singletons (which can be represented
+@@ -403,14 +397,6 @@ splitSingletons method values = (singles, mms)
+         larger1 _   = True
+ 
+ 
+-takeWhileC :: Monad m => (a -> Bool) -> C.Conduit a m a
+-takeWhileC f = loop
+-    where
+-        loop = C.await >>= maybe (return ()) (\v ->
+-                    if f v
+-                        then C.yield v >> loop
+-                        else C.leftover v)
+-
+ performCount :: FileOrStream -> T.Text -> [Annotator] -> CountOpts -> NGLessIO FilePath
+ performCount istream gname annotators0 opts = do
+     outputListLno' TraceOutput ["Starting count..."]
+@@ -423,7 +409,7 @@ performCount istream gname annotators0 opts = do
+         samStream
+             .| do
+                 annotators <-
+-                    takeWhileC (isSamHeaderString . unwrapByteLine)
++                    CC.takeWhile (isSamHeaderString . unwrapByteLine)
+                         .| annSamHeaderParser mapthreads annotators0 opts
+                 lift $ outputListLno' TraceOutput ["Loaded headers. Starting parsing/distribution."]
+                 mcounts <- forM annotators $ \ann -> do
+@@ -513,7 +499,7 @@ normalizeCounts NMNormed counts sizes = do
+ normalizeCounts nmethod counts sizes
+     | nmethod `elem` [NMScaled, NMFpkm] = do
+         -- count vectors always include a -1 at this point (it is
+-        -- ignored in output if the user does not request it, but
++        -- ignored in output if the user does not request it, but is
+         -- always computed). Thus, we compute the sum without it and do
+         -- not normalize it later:
+         let totalCounts v = withVector v (VU.sum . VU.tail)
+@@ -522,7 +508,7 @@ normalizeCounts nmethod counts sizes
+         afternorm <- totalCounts counts
+         let factor
+                 | nmethod == NMScaled = initial / afternorm
+-                | otherwise =  (1.0e9 / initial) --- 1e6 [million fragments] * 1e3 [kilo basepairs] = 1e9
++                | otherwise = 1.0e9 / initial --- 1e6 [million fragments] * 1e3 [kilo basepairs] = 1e9
+         liftIO $ forM_ [1.. VUM.length counts - 1] (VUM.unsafeModify counts (* factor))
+     | otherwise = error "This should be unreachable code [normalizeCounts]"
+ 
+@@ -538,14 +524,14 @@ loadFunctionalMap fname columns = do
+         numCapabilities <- liftIO getNumCapabilities
+         let mapthreads = max 1 (numCapabilities - 1)
+         anns <- C.runConduit $
+-                    CB.sourceFile fname
+-                    .| CB.lines
+-                    .| enumerateC
++                    conduitPossiblyCompressedFile fname
++                    .| linesC
++                    .| CAlg.enumerateC
+                     .| (do
+                         hline <- CL.head
+                         cis <- case hline of
+                             Nothing -> throwDataError ("Empty map file: "++fname)
+-                            Just (_, header) -> let headers = B8.split '\t' header
++                            Just (_, ByteLine header) -> let headers = B8.split '\t' header
+                                                     in runNGLess $ lookUpColumns headers
+                         CC.conduitVector 8192
+                             .| asyncMapEitherC mapthreads (V.mapM (selectColumns cis)) -- after this we have vectors of (<gene name>, [<feature-name>])
+@@ -558,12 +544,9 @@ loadFunctionalMap fname columns = do
+                                                                             (reindex gmap namemap)
+                                                                             (RSV.fromList [RSV.RefSeqInfo n 0.0 | n <- M.keys namemap])
+         reindex :: M.Map B.ByteString [Int] -> M.Map B.ByteString Int -> M.Map B.ByteString [Int]
+-        reindex gmap namemap = M.map (map reindex1) gmap
++        reindex gmap namemap = M.map (map (ix2ix VU.!)) gmap
+             where
+-                reindex1 :: Int -> Int
+-                reindex1 = fromJust . flip M.lookup remap
+-                remap = M.fromList (zip (M.elems namemap) [0..])
+-
++                ix2ix = revnamemap namemap
+         inserts1 :: Int -> LoadFunctionalMapState -> (B.ByteString, [[B.ByteString]]) -> LoadFunctionalMapState
+         inserts1 c (LoadFunctionalMapState first gmap namemap) (name, ids) = LoadFunctionalMapState first' gmap' namemap'
+             where
+@@ -586,9 +569,12 @@ loadFunctionalMap fname columns = do
+                 errormsg = concat (["Could not find column '", B8.unpack col, "'."]
+                                 ++ case findSuggestion (T.pack $ B8.unpack col) (map (T.pack . B8.unpack) $ M.keys colmap) of
+                                         Just (Suggestion valid reason) -> [" Did you mean '", T.unpack valid, "' (", T.unpack reason, ")?"]
+-                                        Nothing -> [])
+-        selectColumns :: [Int] -> (Int, B.ByteString) -> NGLess (B.ByteString, [[B.ByteString]])
+-        selectColumns cols (line_nr, line) = case B8.split '\t' line of
++                                        Nothing -> []
++                                ++ ["\nAvailable columns are:\n"]
++                                ++ ["\t- '"++B8.unpack c ++ "'\n" | c <- M.keys colmap]
++                                )
++        selectColumns :: [Int] -> (Int, ByteLine) -> NGLess (B.ByteString, [[B.ByteString]])
++        selectColumns cols (line_nr, ByteLine line) = case B8.split '\t' line of
+                     (gene:mapped) -> (gene,) . addTags columns <$> selectIds line_nr cols (zip [0..] mapped)
+                     [] -> throwDataError ("Loading functional map file '" ++ fname ++ "' [line " ++ show (line_nr + 1)++ "]: empty line.")
+ 
+@@ -622,6 +608,13 @@ annotationMode _ (Just ref) Nothing Nothing = do
+ annotationMode _ _ _ _ =
+             throwScriptError "For counting, you must do one of\n1. use seqname mode\n2. pass in a GFF file using the argument 'gff_file'\n3. pass in a gene map using the argument 'functional_map'"
+ 
++
++revnamemap :: M.Map B.ByteString Int -> VU.Vector Int
++revnamemap namemap = VU.create $ do
++                r <- VUM.new (M.size namemap)
++                forM_ (zip (M.elems namemap) [0..]) $ uncurry (VUM.write r)
++                return r
++
+ loadGFF :: FilePath -> CountOpts -> NGLessIO [Annotator]
+ loadGFF gffFp opts = do
+         outputListLno' TraceOutput ["Loading GFF file '", gffFp, "'..."]
+@@ -700,8 +693,9 @@ loadGFF gffFp opts = do
+             where
+                 headers = M.keys namemap -- these are sorted
+                 reindexAI :: AnnotationInfo -> AnnotationInfo
+-                reindexAI (s :!: v) = (s :!: fromJust (M.lookup v ix2ix))
+-                ix2ix = M.fromList $ zip (M.elems namemap) [0..]
++                reindexAI (s :!: v) = s :!: (ix2ix VU.! v)
++                ix2ix :: VU.Vector Int
++                ix2ix = revnamemap namemap
+ 
+         gffSize :: GffLine -> Int
+         gffSize g = (gffEnd g - gffStart g) + 1 -- gff format is inclusive at both ends!
+diff --git a/NGLess/Interpretation/FastQ.hs b/NGLess/Interpretation/FastQ.hs
+index e84ee0e..1b0b34a 100644
+--- a/NGLess/Interpretation/FastQ.hs
++++ b/NGLess/Interpretation/FastQ.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2013-2017 NGLess Authors
++{- Copyright 2013-2018 NGLess Authors
+  - License: MIT
+  -}
+ {-# LANGUAGE FlexibleContexts, MultiWayIf #-}
+@@ -16,16 +16,18 @@ import System.IO
+ import Control.Monad
+ import Control.Monad.IO.Class (liftIO)
+ import qualified Data.Text as T
+-import qualified Data.Vector.Unboxed as VU
++import qualified Data.Vector.Storable as VS
+ import qualified Data.Conduit.Combinators as C
+ import qualified Data.Conduit as C
+ import qualified Data.Conduit.Binary as CB
+ import qualified Data.Conduit.List as CL
+ import qualified Data.ByteString as B
++import qualified Data.ByteString.Char8 as B8
+ import qualified Control.Concurrent.Async as A
+ import Control.Monad.Trans.Resource
++import Control.Exception (try)
+ import Control.Monad.Except
+-import Data.Conduit (($$), (=$=))
++import Data.Conduit (($$), (=$=), (.|))
+ import Data.Maybe
+ import Data.Word
+ 
+@@ -66,19 +68,19 @@ encodingFor fp = do
+ 
+     C.runConduit $
+         conduitPossiblyCompressedFile fp
+-        =$= linesCBounded
+-        =$= CL.chunksOf 4
+-        =$= encodingC 255 0
++        .| linesC
++        .| CL.chunksOf 4
++        .| encodingC 255 0
+ 
+ -- | Checks if file has no content
+ --
+ -- Note that this is more than checking if the file is empty: a compressed file
+ -- with no content will not be empty.
+-checkNoContent fp =
++checkNoContent fp = C.runConduit $
+     conduitPossiblyCompressedFile fp
+-        =$= linesCBounded
+-        =$= CL.isolate 1
+-        $$ CL.fold (\_ _ -> False) True
++        .| linesC
++        .| CL.isolate 1
++        .| CL.fold (\_ _ -> False) True
+ 
+ 
+ -- | Drop every tenth FastQ group
+@@ -188,8 +190,8 @@ executePaired (NGOString mate1) args = NGOReadSet mate1 <$> do
+                 enc1 <- fromMaybe (encodingFor fp1') (return <$> enc)
+                 enc2 <- fromMaybe (encodingFor fp1') (return <$> enc)
+                 (es1,es2) <- liftIO $ A.concurrently
+-                            (runExceptT $ statsFromFastQ fp1' enc1)
+-                            (runExceptT $ statsFromFastQ fp2' enc2)
++                            (try $ testNGLessIO $ statsFromFastQ fp1' enc1)
++                            (try $ testNGLessIO $ statsFromFastQ fp2' enc2)
+                 s1 <- runNGLess es1
+                 s2 <- runNGLess es2
+                 outputFQStatistics fp1' s1 enc1
+@@ -220,6 +222,10 @@ getEncArgument fname args =
+             "solexa" -> return $ Just SolexaEncoding
+             other -> throwScriptError ("Unkown encoding for fastq " ++ T.unpack other)
+ 
+-executeShortReadsMethod (MethodName "avg_quality") (ShortRead _ _ rQ) Nothing _ = return $! NGODouble $ fromIntegral (VU.foldl' (\acc n -> acc + toInteger n) (0 :: Integer) rQ) / fromIntegral (VU.length rQ)
+-executeShortReadsMethod (MethodName "fraction_at_least") (ShortRead _ _ rQ) (Just (NGOInteger minq)) _ = return $! NGODouble $ fromIntegral (VU.foldl' (\acc q -> acc + fromEnum (q >= fromInteger minq)) (0 :: Int) rQ) / fromIntegral (VU.length rQ)
++executeShortReadsMethod (MethodName "avg_quality") (ShortRead _ _ rQ) Nothing _ = return $! NGODouble $ fromIntegral (VS.foldl' (\acc n -> acc + toInteger n) (0 :: Integer) rQ) / fromIntegral (VS.length rQ)
++executeShortReadsMethod (MethodName "fraction_at_least") (ShortRead _ _ rQ) (Just (NGOInteger minq)) _ = return $! NGODouble $ fromIntegral (VS.foldl' (\acc q -> acc + fromEnum (q >= fromInteger minq)) (0 :: Int) rQ) / fromIntegral (VS.length rQ)
++executeShortReadsMethod (MethodName "n_to_zero_quality") (ShortRead h sq rQ) Nothing _ = return . NGOShortRead . ShortRead h sq $ VS.generate (VS.length rQ) (\ix ->
++                                                                                                                            if B8.index sq ix == 'N' || B8.index sq ix == 'n'
++                                                                                                                                then 0
++                                                                                                                                else rQ VS.! ix)
+ executeShortReadsMethod (MethodName other) _ _ _ = throwShouldNotOccur ("Unknown short read method: " ++ show other)
+diff --git a/NGLess/Interpretation/Map.hs b/NGLess/Interpretation/Map.hs
+index 619b849..5d77a1e 100644
+--- a/NGLess/Interpretation/Map.hs
++++ b/NGLess/Interpretation/Map.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2013-2017 NGLess Authors
++{- Copyright 2013-2018 NGLess Authors
+  - License: MIT
+  -}
+ {-# LANGUAGE FlexibleContexts #-}
+@@ -20,7 +20,7 @@ import qualified Data.Conduit.List as CL
+ import qualified Data.Conduit.Binary as CB
+ import qualified Data.Conduit.Combinators as CC
+ import qualified Data.Conduit as C
+-import           Data.Conduit (($$), (=$=), (.|))
++import           Data.Conduit ((.|))
+ import           Control.Monad.Extra (unlessM)
+ import           Data.List (foldl', sort)
+ 
+@@ -43,6 +43,7 @@ import NGLess.NGLEnvironment
+ 
+ import qualified StandardModules.Mappers.Bwa as Bwa
+ import qualified StandardModules.Mappers.Soap as Soap
++import qualified StandardModules.Mappers.Minimap2 as Minimap2
+ 
+ import Data.Sam
+ import Data.Fasta
+@@ -69,12 +70,14 @@ data Mapper = Mapper
+ 
+ bwa = Mapper Bwa.createIndex Bwa.hasValidIndex Bwa.callMapper
+ soap = Mapper Soap.createIndex Soap.hasValidIndex Soap.callMapper
++minimap2 = Mapper Minimap2.createIndex Minimap2.hasValidIndex Minimap2.callMapper
+ 
+ getMapper :: T.Text -> NGLessIO Mapper
+ getMapper request = do
+         mappers <- ngleMappersActive <$> nglEnvironment
+         if request `elem` mappers
+             then return $! case request of
++                "minimap2" -> minimap2
+                 "soap" -> soap
+                 "bwa" -> bwa
+                 _ -> error "should not be possible map:getMapper"
+@@ -183,7 +186,7 @@ mapToReference mapper refIndex (ReadSet pairs singletons) extraArgs = do
+                 callMapper mapper refIndex [fp] extraArgs (zipToStats out)
+     liftIO $ hClose hout
+     (newfp,) <$> combinestats statsp statss
+-zipToStats out = snd <$> C.toConsumer (zipSink2 out (linesC =$= samStatsC))
++zipToStats out = snd <$> C.toConsumer (zipSink2 out (linesUnBoundedC .| samStatsC))
+ 
+ splitFASTA :: Int -> FilePath -> FilePath -> NGLessIO [FilePath]
+ splitFASTA megaBPS ifile ofileBase =
+@@ -290,7 +293,7 @@ executeMapStats :: NGLessObject -> KwArgsValues -> NGLessIO NGLessObject
+ executeMapStats (NGOMappedReadSet name sami _) _ = do
+     outputListLno' TraceOutput ["Computing mapstats on ", show sami]
+     let (samfp, stream) = asSamStream sami
+-    (t, al, u) <- stream $$ samStatsC >>= runNGLess
++    (t, al, u) <- C.runConduit (stream .| samStatsC) >>= runNGLess
+     countfp <- makeNGLTempFile samfp "sam_stats_" ".stats" $ \hout ->
+         liftIO . hPutStr hout . concat $
+             [     "\t",  T.unpack name, "\n"
+diff --git a/NGLess/Interpretation/Select.hs b/NGLess/Interpretation/Select.hs
+index 7741ad7..4c08bfc 100644
+--- a/NGLess/Interpretation/Select.hs
++++ b/NGLess/Interpretation/Select.hs
+@@ -18,7 +18,7 @@ import qualified Data.Text.Encoding as TE
+ import           Data.Bits (Bits(..))
+ import           Control.Monad.Except (throwError)
+ import           Data.Either.Combinators (fromRight)
+-import           Data.List (foldl')
++import           Data.List (foldl', find)
+ 
+ import Data.Maybe
+ 
+@@ -56,13 +56,25 @@ _parseConditions args = do
+         asSC "unique" = return SelectUnique
+         asSC c = throwShouldNotOccur ("Check failed.  Should not have seen this condition: '" ++ show c ++ "'")
+ 
+-_matchConditions :: MatchCondition -> [(SamLine,B.ByteString)] -> [(SamLine, B.ByteString)]
+-_matchConditions _ r@[(SamHeader _,_)] = r
+-_matchConditions (DropIf []) slines = slines
+-_matchConditions (DropIf (c:cs)) slines = _matchConditions (DropIf cs) (drop1 c slines)
++matchConditions :: Bool -> MatchCondition -> [(SamLine,B.ByteString)] -> [(SamLine, B.ByteString)]
++matchConditions doReinject conds sg = reinjectSequences doReinject (matchConditions' conds sg)
++    where
++        reinjectSequences True f@((s@SamLine{}, _):rs)
++            | not (any (hasSequence . fst) f) && any (hasSequence . fst) sg
++                = let s' = addSequence s in (s', encodeSamLine s'):rs
++        reinjectSequences _ f = f
++
++        addSequence s = case find hasSequence (fst <$> sg) of
++                            Just s' -> s { samSeq = samSeq s', samQual = samQual s' }
++                            Nothing -> s
++
++matchConditions' :: MatchCondition -> [(SamLine,B.ByteString)] -> [(SamLine, B.ByteString)]
++matchConditions' _ r@[(SamHeader _,_)] = r
++matchConditions' (DropIf []) slines = slines
++matchConditions' (DropIf (c:cs)) slines = matchConditions' (DropIf cs) (drop1 c slines)
+ 
+-_matchConditions (KeepIf []) slines = slines
+-_matchConditions (KeepIf (c:cs)) slines = _matchConditions (KeepIf cs) (keep1 c slines)
++matchConditions' (KeepIf []) slines = slines
++matchConditions' (KeepIf (c:cs)) slines = matchConditions' (KeepIf cs) (keep1 c slines)
+ 
+ drop1 SelectUnmapped g = filter (isAligned . fst) g
+ drop1 SelectMapped g = if any (isAligned . fst) g
+@@ -99,10 +111,17 @@ executeSelect (NGOMappedReadSet name istream ref) args = do
+     paired <- lookupBoolOrScriptErrorDef (return True) "select" "paired" args
+     conditions <- _parseConditions args
+     Just lno <- ngleLno <$> nglEnvironment
++    doReinject <- do
++        v <- ngleVersion <$> nglEnvironment
++        if v < NGLVersion 0 8
++            then do
++                outputListLno' WarningOutput ["Select changed behaviour (for the better) in ngless 0.8. If possible, upgrade your version statement."]
++                return False
++            else return True
+     let (fpsam, istream') = asSamStream istream
+         stream =
+             readSamGroupsAsConduit istream' paired
+-                .| CL.map (_matchConditions conditions)
++                .| CL.map (matchConditions doReinject conditions)
+                 .| streamedSamStats lno ("select_"++T.unpack name) ("select.lno"++show lno)
+                 .| CL.map (map snd)
+                 .| CL.concat
+diff --git a/NGLess/Interpretation/Substrim.hs b/NGLess/Interpretation/Substrim.hs
+index ee6968b..d6886a8 100644
+--- a/NGLess/Interpretation/Substrim.hs
++++ b/NGLess/Interpretation/Substrim.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2013-2016 NGLess Authors
++{- Copyright 2013-2018 NGLess Authors
+  - License: MIT
+  -}
+ {-# LANGUAGE OverloadedStrings #-}
+@@ -11,7 +11,7 @@ module Interpretation.Substrim
+     , endstrimPos
+     ) where
+ 
+-import qualified Data.Vector.Unboxed as VU
++import qualified Data.Vector.Storable as VS
+ 
+ import Data.Maybe
+ import Data.Int
+@@ -31,8 +31,8 @@ endstrim ends cutoff sr@(ShortRead _ _ rQ) = srSlice s n sr
+ 
+ data S4 = S4 {-# UNPACK #-} !Int {-# UNPACK #-} !Int {-# UNPACK #-} !Int {-# UNPACK #-} !Int
+ -- Receives a Quality array and returns a pair with the index and size of the subsequence which has the most consecutive bps respecting the cutoff.
+-subtrimPos :: VU.Vector Int8 -> Int8 -> (Int,Int)
+-subtrimPos quality cutoff = case VU.foldl' calcSubStrim' (S4 0 0 0 0) quality of
++subtrimPos :: VS.Vector Int8 -> Int8 -> (Int,Int)
++subtrimPos quality cutoff = case VS.foldl' calcSubStrim' (S4 0 0 0 0) quality of
+                               S4 i s _ _ -> (i, s)
+     where
+         calcSubStrim' :: S4 -> Int8 -> S4
+@@ -41,22 +41,22 @@ subtrimPos quality cutoff = case VU.foldl' calcSubStrim' (S4 0 0 0 0) quality of
+           | n_s + 1 > s = S4 n_i (n_s + 1) n_i (n_s + 1)
+           | otherwise = S4 i s n_i (n_s + 1)
+ 
+-endstrimPos :: EndstrimEnds -> VU.Vector Int8 -> Int8 -> (Int, Int)
+-endstrimPos method quality cutoff = (start, trim3p $ VU.drop start quality)
++endstrimPos :: EndstrimEnds -> VS.Vector Int8 -> Int8 -> (Int, Int)
++endstrimPos method quality cutoff = (start, trim3p $ VS.drop start quality)
+     where
+         start
+-            | do5 = fromMaybe len $ VU.findIndex (>= cutoff) quality
++            | do5 = fromMaybe len $ VS.findIndex (>= cutoff) quality
+             | otherwise = 0
+         do5 = method `elem` [Endstrim5, EndstrimBoth]
+         do3 = method `elem` [Endstrim3, EndstrimBoth]
+-        len = VU.length quality
++        len = VS.length quality
+         trim3p qs
+-            | do3 = trim3p' (VU.length qs) qs
+-            | otherwise = VU.length qs
+-        trim3p' :: Int -> VU.Vector Int8 -> Int
++            | do3 = trim3p' (VS.length qs) qs
++            | otherwise = VS.length qs
++        trim3p' :: Int -> VS.Vector Int8 -> Int
+         trim3p' 0 _ = 0
+         trim3p' n qs
+-            | qs VU.! (n - 1) >= cutoff = n
++            | qs VS.! (n - 1) >= cutoff = n
+             | otherwise = trim3p' (n - 1) qs
+ 
+ 
+diff --git a/NGLess/Interpretation/Write.hs b/NGLess/Interpretation/Write.hs
+index 3988aa9..7a426ec 100644
+--- a/NGLess/Interpretation/Write.hs
++++ b/NGLess/Interpretation/Write.hs
+@@ -143,6 +143,7 @@ _formatFQOname base insert
+     | "{index}" `isInfixOf` base = return $ replace "{index}" insert base
+     | endswith ".fq" base = return $ removeEnd base ".fq" ++ "." ++ insert ++ ".fq"
+     | endswith ".fq.gz" base = return $ removeEnd base ".fq.gz" ++ "." ++ insert ++ ".fq.gz"
++    | endswith ".fq.bz2" base = return $ removeEnd base ".fq.bz2" ++ "." ++ insert ++ ".fq.bz2"
+     | otherwise = throwScriptError ("Cannot handle filename " ++ base ++ " (expected extension .fq/.fq.gz/.fq.bz2).")
+ 
+ 
+@@ -165,7 +166,7 @@ executeWrite (NGOReadSet _ rs) args = do
+             let inputs = fqpathFilePath <$> multiple
+             fp' <- makeNGLTempFile (head inputs) "concat" "tmp" $ \h ->
+                 C.runConduit
+-                    (mapM_ C.sourceFile inputs .| C.sinkHandle h)
++                    (mapM_ conduitPossiblyCompressedFile inputs .| C.sinkHandle h)
+             moveOrCopyCompress True fp' ofname
+     if woFormatFlags opts == Just "interleaved"
+         then do
+@@ -180,16 +181,10 @@ executeWrite (NGOReadSet _ rs) args = do
+ #endif
+ 
+                             else return CB.sinkHandle
+-                    -- Newer versions of safeio have a more general
+-                    -- 'withOutputFile', so this liftIO/runExceptT/case
+-                    -- construct would not be necessary
+-            errs <- liftIO $ withOutputFile ofile $ \hout -> do
++            withOutputFile ofile $ \hout -> do
+                 let ReadSet pairs singles = rs
+-                runExceptT .  C.runConduitRes $
++                C.runConduitRes $
+                     interleaveFQs pairs singles .| writer hout
+-            case errs of
+-                Right () -> return ()
+-                Left err -> throwError err
+         else case rs of
+             ReadSet [] singles ->
+                 moveOrCopyCompressFQs singles ofile
+diff --git a/NGLess/JSONScript.hs b/NGLess/JSONScript.hs
+index 4e28c54..67c7a0d 100644
+--- a/NGLess/JSONScript.hs
++++ b/NGLess/JSONScript.hs
+@@ -79,6 +79,8 @@ encodeBOp BOpLTE = "lte"
+ encodeBOp BOpEQ = "eq"
+ encodeBOp BOpNEQ = "neq"
+ 
++encodeBOp BOpPathAppend = "path_append"
++
+ encodeUOp :: UOp -> String
+ encodeUOp UOpLen = "len"
+ encodeUOp UOpMinus = "negate"
+diff --git a/NGLess/Language.hs b/NGLess/Language.hs
+index 435062c..6930e0b 100644
+--- a/NGLess/Language.hs
++++ b/NGLess/Language.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2013-2017 NGLess Authors
++{- Copyright 2013-2018 NGLess Authors
+  - License: MIT
+  -}
+ 
+@@ -50,7 +50,7 @@ data UOp = UOpLen | UOpMinus | UOpNot
+     deriving (Eq, Ord, Show)
+ 
+ -- | binary operators
+-data BOp = BOpAdd | BOpMul | BOpGT | BOpGTE | BOpLT | BOpLTE | BOpEQ | BOpNEQ
++data BOp = BOpAdd | BOpMul | BOpGT | BOpGTE | BOpLT | BOpLTE | BOpEQ | BOpNEQ | BOpPathAppend
+     deriving (Eq, Ord, Show)
+ 
+ -- | index expression encodes what is inside an index variable
+diff --git a/NGLess/Modules.hs b/NGLess/Modules.hs
+index 3a91564..9838306 100644
+--- a/NGLess/Modules.hs
++++ b/NGLess/Modules.hs
+@@ -61,6 +61,7 @@ data ArgCheck =
+ data FunctionCheck =
+             FunctionCheckMinNGLessVersion (Int, Int) -- ^ first version where this function can be used
+             | FunctionCheckReturnAssigned -- ^ Function is pure
++            | FunctionCheckNGLVersionIncompatibleChange (Int, Int) -- ^ version when behaviour changed
+             deriving (Eq, Show)
+ 
+ -- | Basic information about argument to a function
+diff --git a/NGLess/NGLess/NGError.hs b/NGLess/NGLess/NGError.hs
+index a425cd0..32eafb1 100644
+--- a/NGLess/NGLess/NGError.hs
++++ b/NGLess/NGLess/NGError.hs
+@@ -1,4 +1,4 @@
+-{-# LANGUAGE GeneralizedNewtypeDeriving, MultiParamTypeClasses, TypeFamilies, FlexibleContexts #-}
++{-# LANGUAGE GeneralizedNewtypeDeriving, MultiParamTypeClasses, TypeFamilies, FlexibleContexts, UndecidableInstances #-}
+ module NGLess.NGError
+     ( NGError(..)
+     , NGErrorType(..)
+@@ -16,8 +16,10 @@ module NGLess.NGError
+ import           Control.DeepSeq
+ import           Control.Monad.Except
+ import           Control.Monad.Trans.Resource
+-import           Control.Monad.Trans.Control
+-import           Control.Monad.Base
++import           Control.Monad.Primitive
++import           Control.Monad.Catch
++import           Control.Monad.IO.Unlift
++import           Control.Exception
+ 
+ -- This file should be a leaf in the import graph (i.e., not import any other NGLess modules)
+ 
+@@ -41,33 +43,34 @@ data NGError = NGError !NGErrorType !String
+ instance NFData NGError where
+     rnf !_ = ()
+ 
++instance Exception NGError
++
+ type NGLess = Either NGError
+ 
+-newtype NGLessIO a = NGLessIO { unwrapNGLessIO :: ExceptT NGError (ResourceT IO) a }
++newtype NGLessIO a = NGLessIO { unwrapNGLessIO :: ResourceT IO a }
+                         deriving (Functor, Applicative, Monad, MonadIO,
+-                        MonadError NGError, MonadResource, MonadThrow,
+-                        MonadBase IO)
++                        MonadResource, MonadThrow, MonadCatch, MonadMask)
+ 
+ 
+-newtype NGLessIOStM a = NGLessIOStM { unwrapNGLessIOStM :: StM (ExceptT NGError (ResourceT IO)) a }
++instance MonadError NGError NGLessIO where
++    throwError = liftIO . throwIO
++    catchError = error "CATCH"
+ 
+-instance MonadBaseControl IO NGLessIO where
+-    type StM NGLessIO a = NGLessIOStM a
+-    liftBaseWith f =  NGLessIO $ liftBaseWith (\q -> f (fmap NGLessIOStM . q . unwrapNGLessIO))
+-    restoreM = NGLessIO . restoreM . unwrapNGLessIOStM
++instance PrimMonad NGLessIO where
++    type PrimState NGLessIO = PrimState IO
++    primitive act = NGLessIO (primitive act)
+ 
++instance MonadUnliftIO NGLessIO where
++    askUnliftIO = NGLessIO $ do
++        u <- askUnliftIO
++        return $ UnliftIO (\(NGLessIO act) -> unliftIO u act)
+ 
+ runNGLess :: (MonadError NGError m) => Either NGError a -> m a
+ runNGLess (Left err) = throwError err
+ runNGLess (Right v) = return v
+ 
+ testNGLessIO :: NGLessIO a -> IO a
+-testNGLessIO (NGLessIO act) = do
+-        perr <- (runResourceT . runExceptT) act
+-        return (showError perr)
+-    where
+-        showError (Right a) = a
+-        showError (Left e) = error (show e)
++testNGLessIO (NGLessIO act) = runResourceT act
+ 
+ -- | Internal bug: user is requested to submit a bug report
+ throwShouldNotOccur :: (MonadError NGError m) => String -> m a
+diff --git a/NGLess/Output.hs b/NGLess/Output.hs
+index 4448aa9..271c2b3 100644
+--- a/NGLess/Output.hs
++++ b/NGLess/Output.hs
+@@ -108,6 +108,7 @@ data FQInfo = FQInfo
+                 { fileName :: String
+                 , scriptLno :: !Int
+                 , gcContent :: !Double
++                , nonATCGFrac :: !Double
+                 , encoding :: !String
+                 , numSeqs :: !Int
+                 , numBasepairs :: !Integer
+@@ -220,10 +221,11 @@ outputFQStatistics fname stats enc = do
+         sSize'  = FQ.seqSize stats
+         nSeq'   = FQ.nSeq stats
+         gc'     = FQ.gcFraction stats
++        nATGC   = FQ.nonATCGFrac stats
+         st      = encodeBPStats stats
+         lno     = fromMaybe 0 lno'
+         nbps    = FQ.nBasepairs stats
+-        binfo   = FQInfo fname lno gc' enc' nSeq' nbps sSize' st
++        binfo   = FQInfo fname lno gc' nATGC enc' nSeq' nbps sSize' st
+     let p s0 s1  = outputListLno' DebugOutput [s0, s1]
+     p "Simple Statistics completed for: " fname
+     p "Number of base pairs: "      (show $ length (FQ.qualCounts stats))
+@@ -318,8 +320,9 @@ writeOutputTSV transpose fqStatsFp mapStatsFp = do
+         formatTSV1 header (i,contents) = BL.concat [BL8.concat [BL8.concat [BL8.pack . show $ i, ":", h], "\t", BL8.pack c, "\n"]
+                                                                         | (h, c) <- zip header contents]
+         asTSVline = BL8.intercalate "\t" . map BL8.pack
+-        fqHeaders                = ["file"  , "encoding", "numSeqs",    "numBasepairs", "minSeqLen",         "maxSeqLen",        "gcContent"]
+-        encodeFQStats FQInfo{..} = [fileName,  encoding, show numSeqs, show numBasepairs, show (fst seqLength), show (snd seqLength), show gcContent]
++        fqHeaders                = ["file"  , "encoding",   "numSeqs",    "numBasepairs",          "minSeqLen",         "maxSeqLen",     "gcContent", "nonATCGFraction"]
++        encodeFQStats FQInfo{..} = [fileName,  encoding, show numSeqs, show numBasepairs, show (fst seqLength), show (snd seqLength), show gcContent, show nonATCGFrac]
++
+ 
+         msHeaders                      = [ "inputFile",  "lineNumber",  "reference",            "total",            "aligned",            "unique"]
+         encodeMapStats MappingInfo{..} = [mi_inputFile,   show mi_lno, mi_reference, show mi_totalReads, show mi_totalAligned, show mi_totalUnique]
+diff --git a/NGLess/Parse.hs b/NGLess/Parse.hs
+index cc8f5fb..574bcea 100644
+--- a/NGLess/Parse.hs
++++ b/NGLess/Parse.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2013-2017 NGLess Authors
++{- Copyright 2013-2018 NGLess Authors
+  - License: MIT
+  -}
+ 
+@@ -20,7 +20,7 @@ import Text.Parsec.Error
+ 
+ import NGLess.NGError
+ import Language
+-import Tokens
++import Tokens (tokenize, Token(..))
+ 
+ 
+ sliceList :: Int -> Int -> [a] -> [a]
+diff --git a/NGLess/StandardModules/Mappers/Bwa.hs b/NGLess/StandardModules/Mappers/Bwa.hs
+index 24b1212..eb49cc4 100644
+--- a/NGLess/StandardModules/Mappers/Bwa.hs
++++ b/NGLess/StandardModules/Mappers/Bwa.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2013-2016 NGLess Authors
++{- Copyright 2013-2018 NGLess Authors
+  - License: MIT
+  -}
+ {-# LANGUAGE RankNTypes #-}
+@@ -9,18 +9,19 @@ module StandardModules.Mappers.Bwa
+     , callMapper
+     ) where
+ 
+-import System.Process
+-import System.Exit
+-import System.Directory
+-import System.Posix (getFileStatus, fileSize, FileOffset)
+-import Control.Monad.IO.Class (liftIO)
++import           System.Process (proc, readProcessWithExitCode)
++import           System.Exit (ExitCode(..))
++import           System.Directory (doesFileExist)
++import           System.Posix (getFileStatus, fileSize, FileOffset)
++import           Control.Monad.IO.Class (liftIO)
+ import qualified Data.ByteString as B
+ import qualified Data.ByteString.Lazy.Char8 as BL8
+ 
+ import qualified Data.Conduit.Process as CP
+ import qualified Data.Conduit.List as CL
+-import qualified Data.Conduit.Internal as C
+-import           Control.Exception (bracket)
++import qualified Data.Conduit as C
++import           Control.Monad.Extra (allM)
++import           Control.Exception (bracket_)
+ import           GHC.Conc (getNumCapabilities, setNumCapabilities)
+ 
+ import Output
+@@ -32,14 +33,8 @@ import FileManagement (bwaBin)
+ -- | Checks whether all necessary files are present for a BWA index
+ -- Does not change any file on disk.
+ hasValidIndex :: FilePath -> NGLessIO Bool
+-hasValidIndex basepath = doAllFilesExist indexRequiredFormats
++hasValidIndex basepath = liftIO $ allM (doesFileExist . (basepath ++)) indexRequiredFormats
+     where
+-        doAllFilesExist [] = return True
+-        doAllFilesExist (x:xs) = do
+-            isThere <- liftIO $ doesFileExist (basepath ++ x)
+-            if isThere
+-                then doAllFilesExist xs
+-                else return False
+         indexRequiredFormats = [".amb",".ann",".bwt",".pac",".sa"]
+ 
+ -- BWA's default indexing parameters are quite conservative. This leads to
+@@ -91,13 +86,13 @@ callMapper refIndex fps extraArgs outC = do
+         cmdargs =  concat [["mem", "-t", show bwathreads], extraArgs, [refIndex], fps]
+         with1Thread :: IO a -> IO a
+         with1Thread act
+-            | strictThreads = bracket
++            | strictThreads = bracket_
+                                 (setNumCapabilities 1)
+-                                (const $ setNumCapabilities numCapabilities)
+-                                (const act)
++                                (setNumCapabilities numCapabilities)
++                                act
+             | otherwise = act
+ 
+-    outputListLno' TraceOutput ["Calling binary ", bwaPath, " with args: ", unwords cmdargs]
++    outputListLno' TraceOutput ["Calling: ", unwords (bwaPath:cmdargs)]
+     let cp = proc bwaPath cmdargs
+     (exitCode, out, err) <- liftIO . with1Thread $
+             CP.sourceProcessWithStreams cp
+@@ -108,7 +103,7 @@ callMapper refIndex fps extraArgs outC = do
+     outputListLno' DebugOutput ["BWA info: ", err']
+     case exitCode of
+         ExitSuccess -> do
+-            outputListLno' InfoOutput ["Done mapping to ", refIndex]
++            outputListLno' InfoOutput ["Finished mapping to ", refIndex]
+             return out
+         ExitFailure code ->
+             throwSystemError $ concat ["Failed mapping\n",
+diff --git a/NGLess/StandardModules/Mappers/Minimap2.hs b/NGLess/StandardModules/Mappers/Minimap2.hs
+new file mode 100644
+index 0000000..e1957be
+--- /dev/null
++++ b/NGLess/StandardModules/Mappers/Minimap2.hs
+@@ -0,0 +1,127 @@
++{- Copyright 2018 NGLess Authors
++ - License: MIT
++ -}
++{-# LANGUAGE RankNTypes #-}
++
++module StandardModules.Mappers.Minimap2
++    ( hasValidIndex
++    , createIndex
++    , callMapper
++    ) where
++
++import           System.Process (proc, readProcessWithExitCode)
++import           System.Exit (ExitCode(..))
++import           System.Directory (doesFileExist)
++import           Control.Monad.IO.Class (liftIO)
++import qualified Data.Vector as V
++import qualified Data.ByteString as B
++import qualified Data.ByteString.Lazy.Char8 as BL8
++
++import qualified Data.Conduit.Process as CP
++import qualified Data.Conduit.List as CL
++import qualified Data.Conduit.Binary as CB
++import qualified Data.Conduit.Combinators as CC
++import qualified Data.Conduit as C
++import           Data.Conduit ((.|))
++import           Data.Conduit.Algorithms (mergeC)
++import           Control.Exception (bracket_)
++import           GHC.Conc (getNumCapabilities, setNumCapabilities)
++import           Control.Monad.Trans.Class (lift)
++
++import Data.Sam (isSamHeaderString)
++import Output
++import NGLess
++import Configuration
++import NGLess.NGLEnvironment
++import Utils.Vector (sortParallel)
++import Utils.Conduit (linesC, ByteLine(..))
++import FileManagement (makeNGLTempFile, minimap2Bin)
++
++indexName :: FilePath -> FilePath
++indexName fp = fp ++ ".mm2.idx"
++
++hasValidIndex :: FilePath -> NGLessIO Bool
++hasValidIndex = liftIO . doesFileExist . indexName
++
++createIndex :: FilePath -> NGLessIO ()
++createIndex fafile = do
++    outputListLno' InfoOutput ["Start minimap2 index creation for ", fafile]
++    minimap2Path <- minimap2Bin
++    (exitCode, out, err) <- liftIO $
++        readProcessWithExitCode minimap2Path [fafile, "-d", indexName fafile] []
++    outputListLno' DebugOutput ["minimap2-index stderr: ", err]
++    outputListLno' DebugOutput ["minimap2-index stdout: ", out]
++    case exitCode of
++        ExitSuccess -> return ()
++        ExitFailure _err -> throwSystemError err
++
++callMapper :: FilePath -> [FilePath] -> [String] -> C.Consumer B.ByteString IO a -> NGLessIO a
++callMapper refIndex fps extraArgs outC = do
++    outputListLno' InfoOutput ["Starting mapping to ", refIndex, " (minimap2)"]
++    minimap2Path <- minimap2Bin
++    numCapabilities <- liftIO getNumCapabilities
++    strictThreads <- nConfStrictThreads <$> nglConfiguration
++    let minimap2threads
++            | strictThreads && numCapabilities > 1 = numCapabilities - 1
++            | otherwise = numCapabilities
++        with1Thread :: IO a -> IO a
++        with1Thread act
++            | strictThreads = bracket_
++                                (setNumCapabilities 1)
++                                (setNumCapabilities numCapabilities)
++                                act
++            | otherwise = act
++        cmdargs =  concat [["-t", show minimap2threads, "-a"], extraArgs, [refIndex], fps]
++    outputListLno' TraceOutput ["Calling: ", minimap2Path, unwords cmdargs]
++    let cp = proc minimap2Path cmdargs
++    usam <- makeNGLTempFile (head fps) "minimap2." "sam" $ \hout -> do
++        (exitCode, _, err) <- liftIO . with1Thread $
++                CP.sourceProcessWithStreams cp
++                    (return ()) -- stdin
++                    (CB.sinkHandle hout) -- stdout
++                    CL.consume -- stderr
++        let err' = BL8.unpack $ BL8.fromChunks err
++        outputListLno' DebugOutput ["minimap2 info: ", err']
++        case exitCode of
++            ExitSuccess ->
++                outputListLno' InfoOutput ["Finished mapping to ", refIndex]
++            ExitFailure code ->
++                throwSystemError $ concat ["Failed mapping\n",
++                                "Executable used::\t", minimap2Path,"\n",
++                                "Command line was::\n\t", unwords cmdargs, "\n",
++                                "minimap2 error code was ", show code, ".\n",
++                                "minimap2 stderr: ", err']
++    C.runConduit $ sortSam usam
++                        .| CL.map (`B.snoc` 10)
++                        .| C.transPipe liftIO outC
++
++sortSam :: FilePath -> C.Source NGLessIO B.ByteString
++sortSam samfile =
++        CB.sourceFile samfile
++            .| linesC
++            .| CL.map unwrapByteLine
++            .| do
++                CC.takeWhile isSamHeaderString
++                partials <- samSorter []
++                C.toProducer (mergeC partials)
++    where
++        samSorter :: [C.Source NGLessIO B.ByteString] -> C.ConduitM B.ByteString B.ByteString NGLessIO [C.Source NGLessIO B.ByteString]
++        samSorter partials = do
++                block <- CC.sinkVectorN (1024*1024)
++                block' <- liftIO $ do
++                    numCapabilities <- getNumCapabilities
++                    block' <- V.unsafeThaw block
++                    sortParallel numCapabilities block'
++                    V.unsafeFreeze block'
++                isDone <- CC.null
++                if isDone
++                    then return (CC.yieldMany block':partials)
++                    else do
++                        partial <- lift $
++                            makeNGLTempFile samfile "partial" ".sam" $ \hout ->
++                                C.runConduit $
++                                    CC.yieldMany block'
++                                        .| CL.map (`B.snoc` 10)
++                                        .| CB.sinkHandle hout
++                        samSorter ((CB.sourceFile partial .| linesC .| CL.map unwrapByteLine):partials)
++
+diff --git a/NGLess/StandardModules/Mappers/Soap.hs b/NGLess/StandardModules/Mappers/Soap.hs
+index a73b402..c6af48d 100644
+--- a/NGLess/StandardModules/Mappers/Soap.hs
++++ b/NGLess/StandardModules/Mappers/Soap.hs
+@@ -26,10 +26,11 @@ import qualified Data.Conduit.TQueue as CA
+ import qualified Data.Conduit.Process as CP
+ import qualified Data.Conduit.List as CL
+ import qualified Data.Conduit as C
+-import           Data.Conduit (($$), (=$=))
++import           Data.Conduit (($$), (.|))
+ import           Control.Monad.Extra (guard, allM, whenM)
+ import           GHC.Conc (getNumCapabilities, setNumCapabilities)
+ import           Data.List (isSuffixOf)
++import           Control.Monad.Except (MonadError)
+ import           Control.Monad.Trans.Resource
+ import           Control.Exception (bracket)
+ 
+@@ -133,13 +134,15 @@ callMapper refIndex fps extraArgs outC = do
+     -- all to work.
+     q <- liftIO $ TQ.newTBMQueueIO 4
+     out <- liftIO $ A.async (CA.sourceTBMQueue q $$ outC)
+-    liftIO . runResourceT $ makeSAMHeader refIndex $$ CA.sinkTBMQueue q False
++    C.runConduitRes $
++        makeSAMHeader refIndex
++            .| CA.sinkTBMQueue q
+     (exitCode', (), err') <- liftIO $
+         withFile otemp ReadMode $ \otemph ->
+             withFile otemp2 ReadMode $ \otemp2h ->
+                 CP.sourceProcessWithStreams soup2sam
+                     (CB.sourceHandle otemph >> CB.sourceHandle otemp2h) -- stdin
+-                    (C.toConsumer $ CA.sinkTBMQueue q True) -- stdout
++                    (C.toConsumer $ CA.sinkTBMQueue q) -- stdout
+                     (CL.consume :: C.Consumer B.ByteString IO [B.ByteString])
+     release rk
+     release rk2
+@@ -153,8 +156,8 @@ callMapper refIndex fps extraArgs outC = do
+                             "SOAP2SAM error code was ", show code, ".\n",
+                             "Error output: ", B8.unpack (B8.intercalate "\n\t" err')]
+ 
+-makeSAMHeader :: (MonadResource m, MonadBaseControl IO m) => FilePath -> C.Source m B.ByteString
+-makeSAMHeader fafile = conduitPossiblyCompressedFile fafile =$= linesC =$= asSamHeader
++makeSAMHeader :: (MonadResource m, MonadUnliftIO m, MonadThrow m, MonadError NGError m) => FilePath -> C.Source m B.ByteString
++makeSAMHeader fafile = conduitPossiblyCompressedFile fafile .| linesC .| asSamHeader
+     where
+         -- asSamHeader :: C.Conduit ByteLine IO B.ByteString
+         asSamHeader = awaitJust $ \(ByteLine line) -> case readId line of
+diff --git a/NGLess/StandardModules/Minimap2.hs b/NGLess/StandardModules/Minimap2.hs
+new file mode 100644
+index 0000000..e1a70a1
+--- /dev/null
++++ b/NGLess/StandardModules/Minimap2.hs
+@@ -0,0 +1,29 @@
++{- Copyright 2018 NGLess Authors
++ - License: MIT
++ -}
++
++module StandardModules.Minimap2
++    ( loadModule
++    ) where
++
++import qualified Data.Text as T
++import Data.Default
++
++import NGLess
++import Modules
++import NGLess.NGLEnvironment
++
++loadModule :: T.Text -> NGLessIO Module
++loadModule _ = do
++    updateNglEnvironment addMinimap2
++    return def
++        { modInfo = ModInfo "stdlib.minimap2" "0.0"
++        , modCitations = [citation]
++        , modFunctions = []
++        , runFunction = \_ _ _ -> throwShouldNotOccur "minimap2 has no functions!"
++        }
++    where
++        addMinimap2 e@NGLEnvironment { ngleMappersActive = p } = e { ngleMappersActive = "minimap2":p }
++        citation = T.concat
++                    ["Li.  Minimap2: pairwise alignment for nucleotide sequences"
++                    ," in arXiv (2018) https://arxiv.org/abs/1708.01492"]
+diff --git a/NGLess/StandardModules/Mocat.hs b/NGLess/StandardModules/Mocat.hs
+index 0bb9001..9fbc4af 100644
+--- a/NGLess/StandardModules/Mocat.hs
++++ b/NGLess/StandardModules/Mocat.hs
+@@ -97,7 +97,7 @@ executeParseCoord (NGOString coordfp) _ = do
+     newfp <- makeNGLTempFile coordfp' "converted_" ".gtf" $ \hout ->
+         C.runConduit $
+             conduitPossiblyCompressedFile coordfp'
+-                .| linesCBounded
++                .| linesC
+                 .| CL.mapM convertToGff
+                 .| C.unlinesAscii
+                 .| C.sinkHandle hout
+diff --git a/NGLess/StandardModules/NGLStdlib.hs b/NGLess/StandardModules/NGLStdlib.hs
+index 87b35a1..e7e92bc 100644
+--- a/NGLess/StandardModules/NGLStdlib.hs
++++ b/NGLess/StandardModules/NGLStdlib.hs
+@@ -13,6 +13,7 @@ import qualified StandardModules.Batch as Batch
+ import qualified StandardModules.Samtools as Samtools
+ import qualified StandardModules.Mocat as Mocat
+ import qualified StandardModules.Soap as Soap
++import qualified StandardModules.Minimap2 as Minimap2
+ import qualified StandardModules.Parallel as Parallel
+ import qualified ExternalModules as Ext
+ 
+@@ -29,5 +30,6 @@ loadStdlibModules = mapM loadModules1
+         loadModules1 (ModInfo "mocat" version) = Mocat.loadModule version
+         loadModules1 (ModInfo "parallel" version) = Parallel.loadModule version
+         loadModules1 (ModInfo "soap" version) = Soap.loadModule version
++        loadModules1 (ModInfo "minimap2" version) = Minimap2.loadModule version
+         loadModules1 minfo = Ext.loadModule minfo
+ 
+diff --git a/NGLess/StandardModules/Parallel.hs b/NGLess/StandardModules/Parallel.hs
+index c0d59c2..d6346e7 100644
+--- a/NGLess/StandardModules/Parallel.hs
++++ b/NGLess/StandardModules/Parallel.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2016-2017 NGLess Authors
++{- Copyright 2016-2018 NGLess Authors
+  - License: MIT
+  -}
+ 
+@@ -6,6 +6,7 @@
+ 
+ module StandardModules.Parallel
+     ( loadModule
++    , pasteCounts
+     ) where
+ 
+ import qualified Data.ByteString as B
+@@ -17,7 +18,6 @@ import qualified Data.Vector as V
+ import qualified Data.Vector.Mutable as VM
+ import           Data.Time (getZonedTime)
+ import           Data.Time.Format (formatTime, defaultTimeLocale)
+-import           Data.List (minimumBy)
+ import           Data.List.Extra (snoc, chunksOf)
+ 
+ #ifndef WINDOWS
+@@ -34,8 +34,10 @@ import qualified Control.Concurrent.Async as A
+ import qualified Control.Concurrent.STM.TBMQueue as TQ
+ import qualified Data.Conduit.List as CL
+ import qualified Data.Conduit.TQueue as CA
+-import           Control.Monad.ST
+-import           Control.Monad.Extra (allM, unlessM, whenJust)
++import qualified Data.Conduit.Algorithms as CAlg
++import           Control.Monad.ST (runST)
++import           Control.Monad.Except (throwError)
++import           Control.Monad.Extra (allM, unlessM)
+ import           Control.DeepSeq
+ import           Data.Traversable
+ import           Control.Concurrent (threadDelay)
+@@ -57,7 +59,7 @@ import qualified Data.Conduit as C
+ import qualified Data.Conduit.Combinators as C
+ import qualified Data.Conduit.Combinators as CC
+ import qualified Data.Conduit.Binary as CB
+-import           Data.Conduit ((.|), (=$=), ($$), ($$+), ($$++))
++import           Data.Conduit ((.|), (=$=), ($$), ($$+))
+ 
+ import Hooks
+ import Output
+@@ -299,55 +301,55 @@ sinkTBMQueue' q shouldClose = do
+ maxNrOpenFiles = 512 :: Int
+ 
+ 
+-type CResSourceBPair = C.ResumableSource NGLessIO (B.ByteString, B.ByteString)
++data SparseCountData = SparseCountData
++                            { spdHeader :: !B.ByteString
++                            , spdIndex :: !Int
++                            , spdPayload :: B.ByteString
++                            }
++    deriving (Eq)
++
++instance Ord SparseCountData where
++    compare (SparseCountData ah ai _) (SparseCountData bh bi _) = case compare ah bh of
++        EQ -> compare ai bi
++        LT -> LT
++        GT -> GT
++
++tagSource :: Int -> C.Conduit ByteLine NGLessIO SparseCountData
++tagSource ix = C.awaitForever $ \(ByteLine v) -> case splitAtTab v of
++    Left err -> lift $ throwError err
++    Right (h, pay) -> C.yield $ SparseCountData h ix pay
++
++complete :: [B.ByteString] -> (SparseCountData,[SparseCountData]) -> ByteLine
++complete placeholders (hinput,inputs) = ByteLine $ B.concat merged
++    where
++        header = spdHeader hinput
++        merged = header:complete' 0 placeholders (hinput:inputs)
++        complete' _ [] [] = []
++        complete' _ [] (_:_) = error "Logic error in StandardModules/parallel//complete"
++        complete' ix (p:ps) xs@(SparseCountData _ ix' pay:rest)
++            | ix == ix' = pay:complete' (ix+1) ps rest
++            | otherwise = p:complete' (ix+1) ps xs
++        complete' _ ps [] = ps
++
+ mergeCounts :: [C.Source NGLessIO ByteLine] -> C.Source NGLessIO ByteLine
+ mergeCounts [] = throwShouldNotOccur "Attempt to merge empty sources"
+ mergeCounts ss = do
+         start <- forM ss $ \s -> do
+-            (s', v) <- lift $ (s .| CL.mapM (splitAtTab . unwrapByteLine)) $$+ CC.head
++            (s', v) <- lift $ s $$+ (CL.mapM (splitAtTab . unwrapByteLine) .| CC.head)
+             case v of
+                 Nothing -> throwShouldNotOccur "Trying to merge a headerless file"
+                 Just (_,hs) -> do
+                     let p = placeholder (B8.count '\t' hs)
+-                    s'' <- lift $ step s'
+-                    return (s'', p)
+-        go start
+-
++                    return (s', p)
++        let (ss', placeholders) = unzip start
++            ss'' = map C.unsealConduitT ss'
++        CAlg.mergeC [s .| tagSource ix | (s,ix) <- zip ss'' [0..]]
++            .| CL.groupOn1 spdHeader
++            .| CL.map (complete placeholders)
+     where
+-        -- Nothing is greater than anything else so it flows to the end
+-        compareMaybe :: (Ord a) => Maybe a -> Maybe a -> Ordering
+-        compareMaybe (Just a) (Just b) = compare a b
+-        compareMaybe Just{} Nothing = LT
+-        compareMaybe Nothing Just{} = GT
+-        compareMaybe Nothing Nothing = EQ
+-
+         placeholder :: Int -> B.ByteString
+         placeholder n = B.intercalate "\t" ("":["0" | _ <- [1..n]])
+ 
+-        fst3 (a, _, _) = a
+-        go :: [(Maybe (B.ByteString, B.ByteString, CResSourceBPair), B.ByteString)] -> C.Source NGLessIO ByteLine
+-        go sources = do
+-            let nextH :: Maybe B.ByteString
+-                nextH = minimumBy compareMaybe (map ((fst3 <$>) . fst) sources)
+-            whenJust nextH $ \header -> do
+-                cn <- forM sources $ \(s, p) -> case s of
+-                    Nothing -> return (p, (s, p))
+-                    Just (h, v, s')
+-                        | header == h -> do
+-                            s'' <- lift $ step s'
+-                            return (v, (s'', p))
+-                        | otherwise -> return (p, (s, p))
+-                let (cur, next) = unzip cn
+-                C.yield $ ByteLine (B.concat (header:cur))
+-                go next
+-        step :: CResSourceBPair -> NGLessIO (Maybe (B.ByteString, B.ByteString, CResSourceBPair))
+-        step s = do
+-            (s', val) <- s $$++ CC.head
+-            case val of
+-              Just (h,v) -> return $ Just (h, v, s')
+-              Nothing -> do
+-                C.closeResumableSource s'
+-                return Nothing
+ 
+ pasteCounts :: [T.Text] -> Bool -> [T.Text] -> [FilePath] -> NGLessIO FilePath
+ pasteCounts comments matchingRows headers inputs
+diff --git a/NGLess/Tokens.hs b/NGLess/Tokens.hs
+index 5e8b3a0..cc8abbb 100644
+--- a/NGLess/Tokens.hs
++++ b/NGLess/Tokens.hs
+@@ -1,13 +1,15 @@
+-{- Copyright 2013-2017 NGLess Authors
++{- Copyright 2013-2018 NGLess Authors
+  - License: MIT
+  -}
+-{-# LANGUAGE FlexibleContexts #-}
++{-# LANGUAGE FlexibleContexts, CPP #-}
+ 
+ -- | This module handles tokenization
+ module Tokens
+     ( Token(..)
+     , tokenize
+-    , _eol
++#ifdef IS_BUILDING_TEST
++    , eol
++#endif
+     ) where
+ 
+ import qualified Data.Text as T
+@@ -56,12 +58,12 @@ ngltoken = comment
+         <|> operator
+         <|> indent
+         <|> taberror
+-        <|> _eol
++        <|> eol
+ 
+-_eol = _semicolon <|> _real_eol
+-
+-_real_eol = ((char '\r' *> char '\n') <|> char '\n') *> pure TNewLine
+-_semicolon = char ';' *> skipMany (char ' ') *> pure TNewLine
++eol = semicolon <|> real_eol
++    where
++        real_eol = ((char '\r' *> char '\n') <|> char '\n') *> pure TNewLine
++        semicolon = char ';' *> skipMany (char ' ') *> pure TNewLine
+ 
+ try_string s = try (string s)
+ 
+@@ -85,7 +87,7 @@ strtext term = T.pack <$> many (escapedchar <|> noneOf [term])
+ comment = singlelinecomment <|> multilinecomment
+ singlelinecomment = commentstart *> skiptoeol
+     where commentstart = (void $ char '#') <|> (void . try $ string "//")
+-skiptoeol = _eol  <|> (anyChar *> skiptoeol)
++skiptoeol = eol  <|> (anyChar *> skiptoeol)
+ multilinecomment = (try_string "/*") *> skipmultilinecomment
+ skipmultilinecomment = (try_string "*/" *> pure (TIndent 0))
+             <|> (anyChar *> skipmultilinecomment)
+@@ -129,6 +131,9 @@ boperator = choice [
+                     | (long,short) <-
+                     [ ("!=", BOpNEQ)
+                     , ("==", BOpEQ)
++
++                    , ("</>", BOpPathAppend)
++
+                     , ("<=", BOpLTE)
+                     , ("<", BOpLT)
+                     , (">=", BOpGTE)
+diff --git a/NGLess/Types.hs b/NGLess/Types.hs
+index c9fb47d..6c550cf 100644
+--- a/NGLess/Types.hs
++++ b/NGLess/Types.hs
+@@ -209,6 +209,7 @@ checkbop BOpLTE a b = checknum a *> checknum b *> return (Just NGLBool)
+ checkbop BOpEQ  a b = checknum a *> checknum b *> return (Just NGLBool)
+ checkbop BOpNEQ a b = checknum a *> checknum b *> return (Just NGLBool)
+ 
++checkbop BOpPathAppend a b = softCheck NGLString a *> softCheck NGLString b *> return (Just NGLString)
+ 
+ softCheck :: NGLType -> Expression -> TypeMSt (Maybe NGLType)
+ softCheck expected expr = do
+diff --git a/NGLess/Utils/Conduit.hs b/NGLess/Utils/Conduit.hs
+index c9c6d06..98f7c04 100644
+--- a/NGLess/Utils/Conduit.hs
++++ b/NGLess/Utils/Conduit.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2013-2017 NGLess Authors
++{- Copyright 2013-2018 NGLess Authors
+  - License: MIT -}
+ {-# LANGUAGE ScopedTypeVariables, FlexibleContexts, CPP #-}
+ 
+@@ -8,8 +8,8 @@ module Utils.Conduit
+     , conduitPossiblyCompressedFile
+     , asyncMapC
+     , asyncMapEitherC
++    , linesUnBoundedC
+     , linesC
+-    , linesCBounded
+     , awaitJust
+     , asyncGzipTo
+     , asyncGzipToFile
+@@ -24,7 +24,7 @@ import qualified Data.ByteString as B
+ import qualified Data.Conduit.Binary as CB
+ import qualified Data.Conduit.List as CL
+ import qualified Data.Conduit as C
+-import           Data.Conduit ((=$=))
++import           Data.Conduit ((.|))
+ 
+ import           Control.Monad (when)
+ import           Control.Monad.IO.Class (MonadIO, liftIO)
+@@ -61,25 +61,28 @@ lineWindowsTerminated line = if not (B.null line) && B.index line (B.length line
+                                 then B.take (B.length line - 1) line
+                                 else line
+                                     where carriage_return = 13
++{-# INLINE lineWindowsTerminated #-}
+ 
+-linesC :: (Monad m) => C.Conduit B.ByteString m ByteLine
+-linesC =
++
++linesUnBoundedC :: (Monad m) => C.Conduit B.ByteString m ByteLine
++linesUnBoundedC =
+     CB.lines
+-        =$= CL.map lineWindowsTerminated
+-        =$= CL.map ByteLine
+-{-# INLINE linesC #-}
++        .| CL.map lineWindowsTerminated
++        .| CL.map ByteLine
++{-# INLINE linesUnBoundedC #-}
+ 
+ 
+-linesCBounded :: (MonadError NGError m) => C.Conduit B.ByteString m ByteLine
+-linesCBounded =
++linesC :: (MonadError NGError m) => C.Conduit B.ByteString m ByteLine
++linesC =
+     linesBounded 65536
+-        =$= CL.map lineWindowsTerminated
+-        =$= CL.map ByteLine
++        .| CL.map (ByteLine . lineWindowsTerminated)
++{-# INLINE linesC #-}
+ 
+ byteLineSinkHandle :: (MonadIO m) => Handle -> C.Sink ByteLine m ()
+ byteLineSinkHandle h = CL.mapM_ (\(ByteLine val) -> liftIO (B.hPut h val >> B.hPut h nl))
+     where
+         nl = B.singleton 10
++{-# INLINE byteLineSinkHandle #-}
+ 
+ zipSource2 a b = C.getZipSource ((,) <$> C.ZipSource a <*> C.ZipSource b)
+ 
+diff --git a/NGLess/Validation.hs b/NGLess/Validation.hs
+index aadf317..d8640bd 100644
+--- a/NGLess/Validation.hs
++++ b/NGLess/Validation.hs
+@@ -1,7 +1,7 @@
+-{- Copyright 2013-2017 NGLess Authors
++{- Copyright 2013-2018 NGLess Authors
+  - License: MIT
+  -}
+-{-# LANGUAGE LambdaCase, FlexibleContexts #-}
++{-# LANGUAGE FlexibleContexts #-}
+ 
+ module Validation
+     ( validate
+@@ -283,6 +283,7 @@ validateNGLessVersionUses mods sc = case nglVersion <$> nglHeader sc of
+                 FunctionCall fname@(FuncName fname') _ kwargs _ ->
+                     whenJust (findFunction mods fname) $ \finfo -> do
+                         checkVersion ["Function ", fname'] $ minVersionFunction finfo
++                        checkVersionChanged ["Function ", fname'] $ minVersionFunctionChanged finfo
+                         forM_ kwargs $ \(Variable name,_) ->
+                             checkVersion ["Using argument ", name, " to function ", fname'] $ checkArg (funcKwArgs finfo) name
+                 MethodCall mname@(MethodName mname') _ _ kwargs ->
+@@ -292,16 +293,28 @@ validateNGLessVersionUses mods sc = case nglVersion <$> nglHeader sc of
+                             checkVersion ["Using argument ", name, " to method ", mname'] $ checkArg (methodKwargsInfo minfo) name
+                 _ -> return ()
+             where
++                showV (a,b) = T.pack (show a ++ "." ++ show b)
+                 checkVersion _ Nothing = return ()
+                 checkVersion prefix (Just minV)
+                     | versionLE minV version = return ()
+-                    | otherwise = tell1lno lno (prefix ++ [" requires ngless version ", T.pack . show $ fst minV, ".", T.pack . show $ snd minV, " (version '", version, "' is active)."])
++                    | otherwise = tell1lno lno (prefix ++ [" requires ngless version ", showV minV, " (version '", version, "' is active)."])
++                checkVersionChanged _ Nothing = return ()
++                checkVersionChanged prefix (Just minV)
++                    | versionLE minV version = return ()
++                    | otherwise = tell1lno lno (prefix ++ [" changed behaviour in an incompatible fashion in version ", showV minV, " (version '", version, "' is active).\n",
++                                                           "See http://ngless.embl.de/whatsnew.html for details on changes."])
+         minVersionFunction :: Function -> Maybe (Int, Int)
+         minVersionFunction finfo =
+             asum $ flip map (funcChecks finfo) $ \case
+                             FunctionCheckMinNGLessVersion minV -> Just minV
+                             _ -> Nothing
+ 
++        minVersionFunctionChanged :: Function -> Maybe (Int, Int)
++        minVersionFunctionChanged finfo =
++            asum $ flip map (funcChecks finfo) $ \case
++                            FunctionCheckNGLVersionIncompatibleChange minV -> Just minV
++                            _ -> Nothing
++
+         minVersionMethod :: MethodInfo -> Maybe (Int, Int)
+         minVersionMethod minfo =
+             asum $ flip map (methodChecks minfo) $ \case
+diff --git a/NGLess/Version.hs b/NGLess/Version.hs
+index fe6ff0f..2b87fcf 100644
+--- a/NGLess/Version.hs
++++ b/NGLess/Version.hs
+@@ -19,7 +19,7 @@ versionStr :: String
+ versionStr = showVersion version
+ 
+ dateStr :: String
+-dateStr = "March 17 2018"
++dateStr = "unreleased"
+ 
+ gitHashStr :: String
+ gitHashStr = $(gitHash)
+diff --git a/README.md b/README.md
+index 008b9ab..8c8821c 100644
+--- a/README.md
++++ b/README.md
+@@ -48,22 +48,22 @@ The recommended way to install NGLess is through
+ Alternatively, a docker container with NGLess is available at
+ [biocontainers](https://quay.io/repository/biocontainers/ngless):
+ 
+-    docker run -v $PWD:/workdir -w /workdir -it quay.io/biocontainers/ngless:0.7.0--py35_0 ngless --version
++    docker run -v $PWD:/workdir -w /workdir -it quay.io/biocontainers/ngless:0.7.1--py35_0 ngless --version
+ 
+ Adapt the mount flags (``-v``) as needed.
+ 
+ ### Linux
+ 
+ You can get a [statically linked version of
+-NGless 0.7.0](http://ngless.embl.de/releases/ngless-0.7.0-Linux64) or a [nighly
++NGless 0.7.1](http://ngless.embl.de/releases/ngless-0.7.1-Linux64) or a [nighly
+ build of the latest development
+ code](https://gitlab.com/ngless/ngless/builds/artifacts/master/raw/bin/ngless?job=build-and-test-ubuntu).
+ This should work across a wide range of Linux versions (please
+ [report](https://github.com/luispedro/ngless/issues) any issues you encounter):
+ 
+-    curl -O http://ngless.embl.de/releases/ngless-0.7.0-Linux64
+-    chmod +x ngless-0.7.0-Linux64
+-    ./ngless-0.7.0-Linux64
++    curl -O http://ngless.embl.de/releases/ngless-0.7.1-Linux64
++    chmod +x ngless-0.7.1-Linux64
++    ./ngless-0.7.1-Linux64
+ 
+ This download bundles bwa, samtools and megahit (also statically linked).
+ 
+diff --git a/Tests-Src/Tests.hs b/Tests-Src/Tests.hs
+index ce5c47a..0df265a 100644
+--- a/Tests-Src/Tests.hs
++++ b/Tests-Src/Tests.hs
+@@ -1,4 +1,4 @@
+-{- Copyright 2013-2017 NGLess Authors
++{- Copyright 2013-2018 NGLess Authors
+  - License: MIT
+  -}
+ {-# LANGUAGE TemplateHaskell, QuasiQuotes #-}
+@@ -19,11 +19,11 @@ import Text.Parsec.Combinator (eof)
+ import System.Directory (removeDirectoryRecursive
+                         ,doesFileExist
+                         )
+-import qualified Data.Vector.Unboxed as VU
++import qualified Data.Vector.Storable as VS
+ import qualified Data.ByteString.Char8 as B
+ 
+ import qualified Data.Conduit as C
+-import           Data.Conduit ((=$=), ($$), (.|))
++import           Data.Conduit ((.|))
+ import           Control.Monad.State.Strict (execState, modify')
+ import           Data.Convertible (convert)
+ 
+@@ -76,7 +76,7 @@ main = do
+ -- Test Tokens module
+ tokenize' fn t = map snd <$> (tokenize fn t)
+ 
+-case_tok_cr = TNewLine @=? (case parse (_eol <* eof) "test" "\r\n" of { Right t -> t; Left _ -> error "Parse failed"; })
++case_tok_cr = TNewLine @=? (case parse (Tokens.eol <* eof) "test" "\r\n" of { Right t -> t; Left _ -> error "Parse failed"; })
+ case_tok_single_line_comment = tokenize' "test" with_comment @?= Right expected
+     where
+         with_comment = "a=0# comment\nb=1\n"
+@@ -116,7 +116,7 @@ indent_space  = "ngless '0.0'\n\
+ 
+ 
+ -- Type Validate pre process operations
+-sr i s q = NGOShortRead (ShortRead i s $ VU.generate (B.length q) (convert . B.index q))
++sr i s q = NGOShortRead (ShortRead i s $ VS.generate (B.length q) (convert . B.index q))
+ 
+ case_pre_process_indexation_1 = _evalIndex' (sr "@IRIS" "AGTACCAA" "aa`aaaaa") [Just (NGOInteger 5), Nothing] @?= (sr "@IRIS" "CAA" "aaa")
+ case_pre_process_indexation_2 = _evalIndex' (sr "@IRIS" "AGTACCAA" "aa`aaaaa") [Nothing, Just (NGOInteger 3)] @?= (sr "@IRIS" "AGT" "aa`")
+@@ -128,35 +128,41 @@ _evalIndex' a b = case _evalIndex a b of
+ 
+ case_pre_process_length_1 = _evalUnary UOpLen (sr "@IRIS" "AGTACCAA" "aa`aaaaa") @?= Right (NGOInteger 8)
+ 
+-case_bop_gte_1 = _evalBinary BOpGTE (NGOInteger 10) (NGOInteger 10) @?= Right (NGOBool True)
+-case_bop_gte_2 = _evalBinary BOpGTE (NGOInteger 11) (NGOInteger 10) @?= Right (NGOBool True)
+-case_bop_gte_3 = _evalBinary BOpGTE (NGOInteger 10) (NGOInteger 11) @?= Right (NGOBool False)
++case_bop_gte_1 = evalBinary BOpGTE (NGOInteger 10) (NGOInteger 10) @?= Right (NGOBool True)
++case_bop_gte_2 = evalBinary BOpGTE (NGOInteger 11) (NGOInteger 10) @?= Right (NGOBool True)
++case_bop_gte_3 = evalBinary BOpGTE (NGOInteger 10) (NGOInteger 11) @?= Right (NGOBool False)
+ 
+-case_bop_gt_1 = _evalBinary BOpGT (NGOInteger 10) (NGOInteger 10) @?= Right (NGOBool False)
+-case_bop_gt_2 = _evalBinary BOpGT (NGOInteger 11) (NGOInteger 10) @?= Right (NGOBool True)
+-case_bop_gt_3 = _evalBinary BOpGT (NGOInteger 10) (NGOInteger 11) @?= Right (NGOBool False)
++case_bop_gt_1 = evalBinary BOpGT (NGOInteger 10) (NGOInteger 10) @?= Right (NGOBool False)
++case_bop_gt_2 = evalBinary BOpGT (NGOInteger 11) (NGOInteger 10) @?= Right (NGOBool True)
++case_bop_gt_3 = evalBinary BOpGT (NGOInteger 10) (NGOInteger 11) @?= Right (NGOBool False)
+ 
+-case_bop_lt_1 = _evalBinary BOpLT (NGOInteger 10) (NGOInteger 10) @?= Right (NGOBool False)
+-case_bop_lt_2 = _evalBinary BOpLT (NGOInteger 11) (NGOInteger 10) @?= Right (NGOBool False)
+-case_bop_lt_3 = _evalBinary BOpLT (NGOInteger 10) (NGOInteger 11) @?= Right (NGOBool True)
++case_bop_lt_1 = evalBinary BOpLT (NGOInteger 10) (NGOInteger 10) @?= Right (NGOBool False)
++case_bop_lt_2 = evalBinary BOpLT (NGOInteger 11) (NGOInteger 10) @?= Right (NGOBool False)
++case_bop_lt_3 = evalBinary BOpLT (NGOInteger 10) (NGOInteger 11) @?= Right (NGOBool True)
+ 
+-case_bop_lte_1 = _evalBinary BOpLTE (NGOInteger 10) (NGOInteger 10) @?= Right (NGOBool True)
+-case_bop_lte_2 = _evalBinary BOpLTE (NGOInteger 11) (NGOInteger 10) @?= Right (NGOBool False)
+-case_bop_lte_3 = _evalBinary BOpLTE (NGOInteger 10) (NGOInteger 11) @?= Right (NGOBool True)
++case_bop_lte_1 = evalBinary BOpLTE (NGOInteger 10) (NGOInteger 10) @?= Right (NGOBool True)
++case_bop_lte_2 = evalBinary BOpLTE (NGOInteger 11) (NGOInteger 10) @?= Right (NGOBool False)
++case_bop_lte_3 = evalBinary BOpLTE (NGOInteger 10) (NGOInteger 11) @?= Right (NGOBool True)
+ 
+-case_bop_eq_1 = _evalBinary BOpEQ (NGOInteger 10) (NGOInteger 10) @?= Right (NGOBool True)
+-case_bop_eq_2 = _evalBinary BOpEQ (NGOInteger 10) (NGOInteger 0) @?= Right (NGOBool False)
++case_bop_eq_1 = evalBinary BOpEQ (NGOInteger 10) (NGOInteger 10) @?= Right (NGOBool True)
++case_bop_eq_2 = evalBinary BOpEQ (NGOInteger 10) (NGOInteger 0) @?= Right (NGOBool False)
+ 
+-case_bop_neq_1 = _evalBinary BOpNEQ (NGOInteger 0) (NGOInteger 10) @?= Right (NGOBool True)
+-case_bop_neq_2 = _evalBinary BOpNEQ (NGOInteger 10) (NGOInteger 10) @?= Right (NGOBool False)
++case_bop_neq_1 = evalBinary BOpNEQ (NGOInteger 0) (NGOInteger 10) @?= Right (NGOBool True)
++case_bop_neq_2 = evalBinary BOpNEQ (NGOInteger 10) (NGOInteger 10) @?= Right (NGOBool False)
+ 
+-case_bop_add_1 = _evalBinary BOpAdd (NGOInteger 0) (NGOInteger 10) @?= Right (NGOInteger 10)
+-case_bop_add_2 = _evalBinary BOpAdd (NGOInteger 10) (NGOInteger 0) @?= Right (NGOInteger 10)
+-case_bop_add_3 = _evalBinary BOpAdd (NGOInteger 10) (NGOInteger 10) @?= Right (NGOInteger 20)
++case_bop_add_1 = evalBinary BOpAdd (NGOInteger 0) (NGOInteger 10) @?= Right (NGOInteger 10)
++case_bop_add_2 = evalBinary BOpAdd (NGOInteger 10) (NGOInteger 0) @?= Right (NGOInteger 10)
++case_bop_add_3 = evalBinary BOpAdd (NGOInteger 10) (NGOInteger 10) @?= Right (NGOInteger 20)
+ 
+-case_bop_mul_1 = _evalBinary BOpMul (NGOInteger 0) (NGOInteger 10) @?= Right (NGOInteger 0)
+-case_bop_mul_2 = _evalBinary BOpMul (NGOInteger 10) (NGOInteger 0) @?= Right (NGOInteger 0)
+-case_bop_mul_3 = _evalBinary BOpMul (NGOInteger 10) (NGOInteger 10) @?= Right (NGOInteger 100)
++case_bop_mul_1 = evalBinary BOpMul (NGOInteger 0) (NGOInteger 10) @?= Right (NGOInteger 0)
++case_bop_mul_2 = evalBinary BOpMul (NGOInteger 10) (NGOInteger 0) @?= Right (NGOInteger 0)
++case_bop_mul_3 = evalBinary BOpMul (NGOInteger 10) (NGOInteger 10) @?= Right (NGOInteger 100)
++
++case_bop_add_path_1 = evalBinary BOpPathAppend (NGOString "dir") (NGOString "file") @?= Right (NGOString "dir/file")
++case_bop_add_path_2 = evalBinary BOpPathAppend (NGOString "dir/subdir") (NGOString "file") @?= Right (NGOString "dir/subdir/file")
++case_bop_add_path_3 = evalBinary BOpPathAppend (NGOString "dir/subdir/") (NGOString "file") @?= Right (NGOString "dir/subdir/file")
++case_bop_add_path_4 = evalBinary BOpPathAppend (NGOString "../dir/subdir/") (NGOString "file") @?= Right (NGOString "../dir/subdir/file")
++case_bop_add_path_5 = evalBinary BOpPathAppend (NGOString "/abs/dir/subdir/") (NGOString "file") @?= Right (NGOString "/abs/dir/subdir/file")
+ 
+ case_uop_minus_1 = _evalUnary UOpMinus (NGOInteger 10) @?= Right (NGOInteger (-10))
+ case_uop_minus_2 = _evalUnary UOpMinus (NGOInteger (-10)) @?= Right (NGOInteger 10)
+@@ -219,10 +225,11 @@ countC = loop (0 :: Int)
+ make_unique_test n = let enc = SolexaEncoding in do
+     nuniq <- testNGLessIO $ do
+         newfp <- performUnique "test_samples/data_set_repeated.fq" enc n
+-        conduitPossiblyCompressedFile newfp
+-                =$= linesC
+-                =$= fqDecodeC enc
+-                $$ countC
++        C.runConduit $
++            conduitPossiblyCompressedFile newfp
++                .| linesC
++                .| fqDecodeC enc
++                .| countC
+     let n' = min n 4
+     nuniq @?=  (n' * 54)
+ 
+diff --git a/Tests-Src/Tests/FastQ.hs b/Tests-Src/Tests/FastQ.hs
+index c13b05a..d3a0a37 100644
+--- a/Tests-Src/Tests/FastQ.hs
++++ b/Tests-Src/Tests/FastQ.hs
+@@ -11,7 +11,7 @@ import Test.Framework.Providers.HUnit
+ import Test.Framework.Providers.QuickCheck2
+ 
+ import qualified Data.ByteString.Lazy as BL
+-import qualified Data.Vector.Unboxed as VU
++import qualified Data.Vector.Storable as VS
+ import           Data.Int
+ import           Data.Conduit ((.|))
+ import qualified Data.Conduit as C
+@@ -40,15 +40,15 @@ case_parse_encode_solexa = encodeRecover SolexaEncoding @?= Right reads3
+ fqDecode :: FastQEncoding -> BL.ByteString -> NGLess [ShortRead]
+ fqDecode enc s = C.runConduit $
+     CL.sourceList (BL.toChunks s)
+-        .| linesCBounded
++        .| linesC
+         .| fqDecodeC enc
+         .| CL.consume
+ 
+ encodeRecover enc = fqDecode enc . BL.fromChunks $ map (fqEncode enc) reads3
+ reads3 =
+-    [ShortRead "x" "acttg" (VU.fromList [35,16,34,34,24])
+-    ,ShortRead "y" "catgt" (VU.fromList [33,17,25,37,18])
+-    ,ShortRead "z" "ccggg" (VU.fromList [32,16,20,32,17])
++    [ShortRead "x" "acttg" (VS.fromList [35,16,34,34,24])
++    ,ShortRead "y" "catgt" (VS.fromList [33,17,25,37,18])
++    ,ShortRead "z" "ccggg" (VS.fromList [32,16,20,32,17])
+     ]
+ 
+ simpleStats f = testNGLessIO $ do
+@@ -99,48 +99,48 @@ genericTrimPos MSubstrim = subtrimPos
+ genericTrimPos (MEndstrim ends) = endstrimPos ends
+ 
+ 
+-newtype VU8 = VU8 (VU.Vector Int8)
++newtype VS8 = VS8 (VS.Vector Int8)
+     deriving (Eq, Show)
+ 
+-instance Arbitrary VU8 where
+-    arbitrary = VU8 . VU.fromList <$> listOf1 (oneof (return <$> [-5 .. 40]))
++instance Arbitrary VS8 where
++    arbitrary = VS8 . VS.fromList <$> listOf1 (oneof (return <$> [-5 .. 40]))
+ 
+ -- Test SUBSTRIM/ENDSTRIM
+ --Property 1: For every s, the size must be always smaller than the input
+-prop_trim_maxsize m (VU8 s) = st >= 0 && e <= VU.length s
++prop_trim_maxsize m (VS8 s) = st >= 0 && e <= VS.length s
+     where (st,e) = genericTrimPos m s 20
+ 
+ -- Property 2: substrim should be idempotent
+-prop_strim_idempotent m (VU8 s) = st == 0 && n == VU.length s1
++prop_strim_idempotent m (VS8 s) = st == 0 && n == VS.length s1
+     where
+         (st0, n0) = genericTrimPos m s 20
+-        s1 = VU.slice st0 n0 s
++        s1 = VS.slice st0 n0 s
+         (st,n) = genericTrimPos m s1 20
+ 
+-data SplitVU8 = SplitVU8 (VU.Vector Int8) Int Int
++data SplitVU8 = SplitVU8 (VS.Vector Int8) Int Int
+     deriving (Show)
+ 
+ instance Arbitrary SplitVU8 where
+     arbitrary = do
+-        qs <- VU.fromList <$> listOf1 arbitrary
+-        st <- elements [0 .. VU.length qs - 1]
+-        n <- elements [0 .. VU.length qs - st]
++        qs <- VS.fromList <$> listOf1 arbitrary
++        st <- elements [0 .. VS.length qs - 1]
++        n <- elements [0 .. VS.length qs - st]
+         return $! SplitVU8 qs st n
+ 
+ prop_substrim_no_better (SplitVU8 qs s n) = not valid || n' >= n
+     where
+         thr = 20
+-        valid = VU.all (> thr) (VU.slice s n qs)
++        valid = VS.all (> thr) (VS.slice s n qs)
+         (_, n') = subtrimPos qs thr
+ 
+-case_substrim_normal_exec =  subtrimPos (VU.fromList [10,11,12,123,122,111,10,11,0]) 20 @?= (3,3)
+-case_substrim_empty_quals = subtrimPos VU.empty 20 @?= (0,0)
++case_substrim_normal_exec =  subtrimPos (VS.fromList [10,11,12,123,122,111,10,11,0]) 20 @?= (3,3)
++case_substrim_empty_quals = subtrimPos VS.empty 20 @?= (0,0)
+ 
+-case_endstrim_quals_allbad = snd (endstrimPos EndstrimBoth (VU.fromList [1,2,2,2,2,1,2,2]) 10) @?= 0
+-case_endstrim_quals_allbad_tresh = snd (endstrimPos EndstrimBoth (VU.fromList [9,9,9,9]) 10) @?= 0
+-case_endstrim_quals_allOK_tresh = endstrimPos EndstrimBoth (VU.fromList [10,10,10,10]) 10 @?= (0,4)
+-case_endstrim_quals_one_OK = endstrimPos EndstrimBoth (VU.fromList [9,9,10,9]) 10 @?= (2,1)
+-case_endstrim_quals_one_OK_3 = endstrimPos Endstrim3 (VU.fromList [9,9,10,9]) 10 @?= (0,3)
+-case_endstrim_quals_one_OK_5 = endstrimPos Endstrim5 (VU.fromList [9,9,10,9]) 10 @?= (2,2)
+-case_endstrim_1 = endstrimPos EndstrimBoth (VU.fromList [9,9,10,9,9,10,9]) 10 @?= (2,4)
++case_endstrim_quals_allbad = snd (endstrimPos EndstrimBoth (VS.fromList [1,2,2,2,2,1,2,2]) 10) @?= 0
++case_endstrim_quals_allbad_tresh = snd (endstrimPos EndstrimBoth (VS.fromList [9,9,9,9]) 10) @?= 0
++case_endstrim_quals_allOK_tresh = endstrimPos EndstrimBoth (VS.fromList [10,10,10,10]) 10 @?= (0,4)
++case_endstrim_quals_one_OK = endstrimPos EndstrimBoth (VS.fromList [9,9,10,9]) 10 @?= (2,1)
++case_endstrim_quals_one_OK_3 = endstrimPos Endstrim3 (VS.fromList [9,9,10,9]) 10 @?= (0,3)
++case_endstrim_quals_one_OK_5 = endstrimPos Endstrim5 (VS.fromList [9,9,10,9]) 10 @?= (2,2)
++case_endstrim_1 = endstrimPos EndstrimBoth (VS.fromList [9,9,10,9,9,10,9]) 10 @?= (2,4)
+ 
+diff --git a/Tests-Src/Tests/Utils.hs b/Tests-Src/Tests/Utils.hs
+index 0467893..ab3585c 100644
+--- a/Tests-Src/Tests/Utils.hs
++++ b/Tests-Src/Tests/Utils.hs
+@@ -13,14 +13,11 @@ import qualified Data.Text as T
+ import qualified Data.ByteString as B
+ import Control.Monad.IO.Class (liftIO)
+ import System.IO
+-import CmdArgs
+ 
+ import Language
+ import Parse
+-import Configuration
+ import FileManagement
+ import NGLess
+-import NGLess.NGLEnvironment
+ 
+ isError :: Either a b -> Assertion
+ isError = isErrorMsg "Error not caught"
+diff --git a/build-scripts/minimap2-static-compile.patch b/build-scripts/minimap2-static-compile.patch
+new file mode 100644
+index 0000000..f27354e
+--- /dev/null
++++ b/build-scripts/minimap2-static-compile.patch
+@@ -0,0 +1,307 @@
++diff -u minimap2-2.9/getopt.c minimap2-2.9.patched/getopt.c
++--- minimap2-2.9/getopt.c	2018-02-24 15:35:35.000000000 +0100
+++++ minimap2-2.9.patched/getopt.c	2018-03-19 15:14:36.694803677 +0100
++@@ -3,10 +3,15 @@
++ #include <string.h>
++ #include "getopt.h"
++ 
++-char *optarg;
++-int optind=1, opterr=1, optopt, __optpos, optreset=0;
+++char *mm_optarg;
+++int mm_optind=1, mm_opterr=1, mm_optopt, __optpos, mm_optreset=0;
++ 
++ #define optpos __optpos
+++#define optarg mm_optarg
+++#define optind mm_optind
+++#define opterr mm_opterr
+++#define optopt mm_optopt
+++#define optreset mm_optreset
++ 
++ static void __getopt_msg(const char *a, const char *b, const char *c, size_t l)
++ {
++@@ -23,7 +28,7 @@
++ #endif
++ }
++ 
++-int getopt(int argc, char * const argv[], const char *optstring)
+++int mm_getopt(int argc, char * const argv[], const char *optstring)
++ {
++ 	int i, c, d;
++ 	int k, l;
++@@ -173,7 +178,7 @@
++ 			return '?';
++ 		}
++ 	}
++-	return getopt(argc, argv, optstring);
+++	return mm_getopt(argc, argv, optstring);
++ }
++ 
++ static int __getopt_long(int argc, char *const *argv, const char *optstring, const struct option *longopts, int *idx, int longonly)
++@@ -205,12 +210,12 @@
++ 	return ret;
++ }
++ 
++-int getopt_long(int argc, char *const *argv, const char *optstring, const struct option *longopts, int *idx)
+++int mm_getopt_long(int argc, char *const *argv, const char *optstring, const struct option *longopts, int *idx)
++ {
++ 	return __getopt_long(argc, argv, optstring, longopts, idx, 0);
++ }
++ 
++-int getopt_long_only(int argc, char *const *argv, const char *optstring, const struct option *longopts, int *idx)
+++int mm_getopt_long_only(int argc, char *const *argv, const char *optstring, const struct option *longopts, int *idx)
++ {
++ 	return __getopt_long(argc, argv, optstring, longopts, idx, 1);
++ }
++diff -u minimap2-2.9/getopt.h minimap2-2.9.patched/getopt.h
++--- minimap2-2.9/getopt.h	2018-02-24 15:35:35.000000000 +0100
+++++ minimap2-2.9.patched/getopt.h	2018-03-19 15:11:25.495030768 +0100
++@@ -28,9 +28,9 @@
++ extern "C" {
++ #endif
++ 
++-int getopt(int, char * const [], const char *);
++-extern char *optarg;
++-extern int optind, opterr, optopt, optreset;
+++int mm_getopt(int, char * const [], const char *);
+++extern char *mm_optarg;
+++extern int mm_optind, mm_opterr, mm_optopt, mm_optreset;
++ 
++ struct option {
++ 	const char *name;
++@@ -39,8 +39,8 @@
++ 	int val;
++ };
++ 
++-int getopt_long(int, char *const *, const char *, const struct option *, int *);
++-int getopt_long_only(int, char *const *, const char *, const struct option *, int *);
+++int mm_getopt_long(int, char *const *, const char *, const struct option *, int *);
+++int mm_getopt_long_only(int, char *const *, const char *, const struct option *, int *);
++ 
++ #define no_argument        0
++ #define required_argument  1
++diff -u minimap2-2.9/main.c minimap2-2.9.patched/main.c
++--- minimap2-2.9/main.c	2018-02-24 15:35:35.000000000 +0100
+++++ minimap2-2.9.patched/main.c	2018-03-19 15:12:34.938950513 +0100
++@@ -66,7 +66,7 @@
++ {
++ 	double x;
++ 	char *p;
++-	x = strtod(optarg, &p);
+++	x = strtod(mm_optarg, &p);
++ 	if (*p == 'G' || *p == 'g') x *= 1e9;
++ 	else if (*p == 'M' || *p == 'm') x *= 1e6;
++ 	else if (*p == 'K' || *p == 'k') x *= 1e3;
++@@ -102,30 +102,30 @@
++ 	mm_realtime0 = realtime();
++ 	mm_set_opt(0, &ipt, &opt);
++ 
++-	while ((c = getopt_long(argc, argv, opt_str, long_options, &long_idx)) >= 0) // apply option -x/preset first
+++	while ((c = mm_getopt_long(argc, argv, opt_str, long_options, &long_idx)) >= 0) // apply option -x/preset first
++ 		if (c == 'x') {
++-			if (mm_set_opt(optarg, &ipt, &opt) < 0) {
++-				fprintf(stderr, "[ERROR] unknown preset '%s'\n", optarg);
+++			if (mm_set_opt(mm_optarg, &ipt, &opt) < 0) {
+++				fprintf(stderr, "[ERROR] unknown preset '%s'\n", mm_optarg);
++ 				return 1;
++ 			}
++ 			break;
++ 		}
++-	optreset = 1;
+++	mm_optreset = 1;
++ 
++-	while ((c = getopt_long(argc, argv, opt_str, long_options, &long_idx)) >= 0) {
++-		if (c == 'w') ipt.w = atoi(optarg);
++-		else if (c == 'k') ipt.k = atoi(optarg);
+++	while ((c = mm_getopt_long(argc, argv, opt_str, long_options, &long_idx)) >= 0) {
+++		if (c == 'w') ipt.w = atoi(mm_optarg);
+++		else if (c == 'k') ipt.k = atoi(mm_optarg);
++ 		else if (c == 'H') ipt.flag |= MM_I_HPC;
++-		else if (c == 'd') fnw = optarg; // the above are indexing related options, except -I
++-		else if (c == 'r') opt.bw = (int)mm_parse_num(optarg);
++-		else if (c == 't') n_threads = atoi(optarg);
++-		else if (c == 'v') mm_verbose = atoi(optarg);
++-		else if (c == 'g') opt.max_gap = (int)mm_parse_num(optarg);
++-		else if (c == 'G') mm_mapopt_max_intron_len(&opt, (int)mm_parse_num(optarg));
++-		else if (c == 'F') opt.max_frag_len = (int)mm_parse_num(optarg);
++-		else if (c == 'N') opt.best_n = atoi(optarg);
++-		else if (c == 'p') opt.pri_ratio = atof(optarg);
++-		else if (c == 'M') opt.mask_level = atof(optarg);
+++		else if (c == 'd') fnw = mm_optarg; // the above are indexing related options, except -I
+++		else if (c == 'r') opt.bw = (int)mm_parse_num(mm_optarg);
+++		else if (c == 't') n_threads = atoi(mm_optarg);
+++		else if (c == 'v') mm_verbose = atoi(mm_optarg);
+++		else if (c == 'g') opt.max_gap = (int)mm_parse_num(mm_optarg);
+++		else if (c == 'G') mm_mapopt_max_intron_len(&opt, (int)mm_parse_num(mm_optarg));
+++		else if (c == 'F') opt.max_frag_len = (int)mm_parse_num(mm_optarg);
+++		else if (c == 'N') opt.best_n = atoi(mm_optarg);
+++		else if (c == 'p') opt.pri_ratio = atof(mm_optarg);
+++		else if (c == 'M') opt.mask_level = atof(mm_optarg);
++ 		else if (c == 'c') opt.flag |= MM_F_OUT_CG | MM_F_CIGAR;
++ 		else if (c == 'D') opt.flag |= MM_F_NO_DIAG;
++ 		else if (c == 'P') opt.flag |= MM_F_ALL_CHAINS;
++@@ -134,57 +134,57 @@
++ 		else if (c == 'Q') opt.flag |= MM_F_NO_QUAL;
++ 		else if (c == 'Y') opt.flag |= MM_F_SOFTCLIP;
++ 		else if (c == 'L') opt.flag |= MM_F_LONG_CIGAR;
++-		else if (c == 'T') opt.sdust_thres = atoi(optarg);
++-		else if (c == 'n') opt.min_cnt = atoi(optarg);
++-		else if (c == 'm') opt.min_chain_score = atoi(optarg);
++-		else if (c == 'A') opt.a = atoi(optarg);
++-		else if (c == 'B') opt.b = atoi(optarg);
++-		else if (c == 's') opt.min_dp_max = atoi(optarg);
++-		else if (c == 'C') opt.noncan = atoi(optarg);
++-		else if (c == 'I') ipt.batch_size = mm_parse_num(optarg);
++-		else if (c == 'K') opt.mini_batch_size = (int)mm_parse_num(optarg);
++-		else if (c == 'R') rg = optarg;
+++		else if (c == 'T') opt.sdust_thres = atoi(mm_optarg);
+++		else if (c == 'n') opt.min_cnt = atoi(mm_optarg);
+++		else if (c == 'm') opt.min_chain_score = atoi(mm_optarg);
+++		else if (c == 'A') opt.a = atoi(mm_optarg);
+++		else if (c == 'B') opt.b = atoi(mm_optarg);
+++		else if (c == 's') opt.min_dp_max = atoi(mm_optarg);
+++		else if (c == 'C') opt.noncan = atoi(mm_optarg);
+++		else if (c == 'I') ipt.batch_size = mm_parse_num(mm_optarg);
+++		else if (c == 'K') opt.mini_batch_size = (int)mm_parse_num(mm_optarg);
+++		else if (c == 'R') rg = mm_optarg;
++ 		else if (c == 'h') fp_help = stdout;
++ 		else if (c == '2') opt.flag |= MM_F_2_IO_THREADS;
++-		else if (c == 0 && long_idx == 0) ipt.bucket_bits = atoi(optarg); // --bucket-bits
++-		else if (c == 0 && long_idx == 2) opt.seed = atoi(optarg); // --seed
+++		else if (c == 0 && long_idx == 0) ipt.bucket_bits = atoi(mm_optarg); // --bucket-bits
+++		else if (c == 0 && long_idx == 2) opt.seed = atoi(mm_optarg); // --seed
++ 		else if (c == 0 && long_idx == 3) mm_dbg_flag |= MM_DBG_NO_KALLOC; // --no-kalloc
++ 		else if (c == 0 && long_idx == 4) mm_dbg_flag |= MM_DBG_PRINT_QNAME; // --print-qname
++ 		else if (c == 0 && long_idx == 6) mm_dbg_flag |= MM_DBG_PRINT_QNAME | MM_DBG_PRINT_SEED, n_threads = 1; // --print-seed
++-		else if (c == 0 && long_idx == 7) opt.max_chain_skip = atoi(optarg); // --max-chain-skip
++-		else if (c == 0 && long_idx == 8) opt.min_ksw_len = atoi(optarg); // --min-dp-len
+++		else if (c == 0 && long_idx == 7) opt.max_chain_skip = atoi(mm_optarg); // --max-chain-skip
+++		else if (c == 0 && long_idx == 8) opt.min_ksw_len = atoi(mm_optarg); // --min-dp-len
++ 		else if (c == 0 && long_idx == 9) mm_dbg_flag |= MM_DBG_PRINT_QNAME | MM_DBG_PRINT_ALN_SEQ, n_threads = 1; // --print-aln-seq
++ 		else if (c == 0 && long_idx ==10) opt.flag |= MM_F_SPLICE; // --splice
++ 		else if (c == 0 && long_idx ==12) opt.flag |= MM_F_NO_LJOIN; // --no-long-join
++ 		else if (c == 0 && long_idx ==13) opt.flag |= MM_F_SR; // --sr
++-		else if (c == 0 && long_idx ==17) opt.end_bonus = atoi(optarg); // --end-bonus
+++		else if (c == 0 && long_idx ==17) opt.end_bonus = atoi(mm_optarg); // --end-bonus
++ 		else if (c == 0 && long_idx ==18) opt.flag |= MM_F_INDEPEND_SEG; // --no-pairing
++ 		else if (c == 0 && long_idx ==20) ipt.flag |= MM_I_NO_SEQ; // --idx-no-seq
++-		else if (c == 0 && long_idx ==21) opt.anchor_ext_shift = atoi(optarg); // --end-seed-pen
+++		else if (c == 0 && long_idx ==21) opt.anchor_ext_shift = atoi(mm_optarg); // --end-seed-pen
++ 		else if (c == 0 && long_idx ==22) opt.flag |= MM_F_FOR_ONLY; // --for-only
++ 		else if (c == 0 && long_idx ==23) opt.flag |= MM_F_REV_ONLY; // --rev-only
++-		else if (c == 0 && long_idx ==27) opt.max_clip_ratio = atof(optarg); // --max-clip-ratio
+++		else if (c == 0 && long_idx ==27) opt.max_clip_ratio = atof(mm_optarg); // --max-clip-ratio
++ 		else if (c == 0 && long_idx == 14) { // --frag
++-			yes_or_no(&opt, MM_F_FRAG_MODE, long_idx, optarg, 1);
+++			yes_or_no(&opt, MM_F_FRAG_MODE, long_idx, mm_optarg, 1);
++ 		} else if (c == 0 && long_idx == 15) { // --secondary
++-			yes_or_no(&opt, MM_F_NO_PRINT_2ND, long_idx, optarg, 0);
+++			yes_or_no(&opt, MM_F_NO_PRINT_2ND, long_idx, mm_optarg, 0);
++ 		} else if (c == 0 && long_idx == 16) { // --cs
++ 			opt.flag |= MM_F_OUT_CS | MM_F_CIGAR;
++-			if (optarg == 0 || strcmp(optarg, "short") == 0) {
+++			if (mm_optarg == 0 || strcmp(mm_optarg, "short") == 0) {
++ 				opt.flag &= ~MM_F_OUT_CS_LONG;
++-			} else if (strcmp(optarg, "long") == 0) {
+++			} else if (strcmp(mm_optarg, "long") == 0) {
++ 				opt.flag |= MM_F_OUT_CS_LONG;
++-			} else if (strcmp(optarg, "none") == 0) {
+++			} else if (strcmp(mm_optarg, "none") == 0) {
++ 				opt.flag &= ~MM_F_OUT_CS;
++ 			} else if (mm_verbose >= 2) {
++ 				fprintf(stderr, "[WARNING]\033[1;31m --cs only takes 'short' or 'long'. Invalid values are assumed to be 'short'.\033[0m\n");
++ 			}
++ 		} else if (c == 0 && long_idx == 19) { // --splice-flank
++-			yes_or_no(&opt, MM_F_SPLICE_FLANK, long_idx, optarg, 1);
+++			yes_or_no(&opt, MM_F_SPLICE_FLANK, long_idx, mm_optarg, 1);
++ 		} else if (c == 0 && long_idx == 24) { // --heap-sort
++-			yes_or_no(&opt, MM_F_HEAP_SORT, long_idx, optarg, 1);
+++			yes_or_no(&opt, MM_F_HEAP_SORT, long_idx, mm_optarg, 1);
++ 		} else if (c == 0 && long_idx == 26) { // --dual
++-			yes_or_no(&opt, MM_F_NO_DUAL, long_idx, optarg, 0);
+++			yes_or_no(&opt, MM_F_NO_DUAL, long_idx, mm_optarg, 0);
++ 		} else if (c == 'S') {
++ 			opt.flag |= MM_F_OUT_CS | MM_F_CIGAR | MM_F_OUT_CS_LONG;
++ 			if (mm_verbose >= 2)
++@@ -195,27 +195,27 @@
++ 		} else if (c == 'f') {
++ 			double x;
++ 			char *p;
++-			x = strtod(optarg, &p);
+++			x = strtod(mm_optarg, &p);
++ 			if (x < 1.0) opt.mid_occ_frac = x, opt.mid_occ = 0;
++ 			else opt.mid_occ = (int)(x + .499);
++ 			if (*p == ',') opt.max_occ = (int)(strtod(p+1, &p) + .499);
++ 		} else if (c == 'u') {
++-			if (*optarg == 'b') opt.flag |= MM_F_SPLICE_FOR|MM_F_SPLICE_REV; // both strands
++-			else if (*optarg == 'f') opt.flag |= MM_F_SPLICE_FOR, opt.flag &= ~MM_F_SPLICE_REV; // match GT-AG
++-			else if (*optarg == 'r') opt.flag |= MM_F_SPLICE_REV, opt.flag &= ~MM_F_SPLICE_FOR; // match CT-AC (reverse complement of GT-AG)
++-			else if (*optarg == 'n') opt.flag &= ~(MM_F_SPLICE_FOR|MM_F_SPLICE_REV); // don't try to match the GT-AG signal
+++			if (*mm_optarg == 'b') opt.flag |= MM_F_SPLICE_FOR|MM_F_SPLICE_REV; // both strands
+++			else if (*mm_optarg == 'f') opt.flag |= MM_F_SPLICE_FOR, opt.flag &= ~MM_F_SPLICE_REV; // match GT-AG
+++			else if (*mm_optarg == 'r') opt.flag |= MM_F_SPLICE_REV, opt.flag &= ~MM_F_SPLICE_FOR; // match CT-AC (reverse complement of GT-AG)
+++			else if (*mm_optarg == 'n') opt.flag &= ~(MM_F_SPLICE_FOR|MM_F_SPLICE_REV); // don't try to match the GT-AG signal
++ 			else {
++ 				fprintf(stderr, "[ERROR]\033[1;31m unrecognized cDNA direction\033[0m\n");
++ 				return 1;
++ 			}
++ 		} else if (c == 'z') {
++-			opt.zdrop = opt.zdrop_inv = strtol(optarg, &s, 10);
+++			opt.zdrop = opt.zdrop_inv = strtol(mm_optarg, &s, 10);
++ 			if (*s == ',') opt.zdrop_inv = strtol(s + 1, &s, 10);
++ 		} else if (c == 'O') {
++-			opt.q = opt.q2 = strtol(optarg, &s, 10);
+++			opt.q = opt.q2 = strtol(mm_optarg, &s, 10);
++ 			if (*s == ',') opt.q2 = strtol(s + 1, &s, 10);
++ 		} else if (c == 'E') {
++-			opt.e = opt.e2 = strtol(optarg, &s, 10);
+++			opt.e = opt.e2 = strtol(mm_optarg, &s, 10);
++ 			if (*s == ',') opt.e2 = strtol(s + 1, &s, 10);
++ 		}
++ 	}
++@@ -228,7 +228,7 @@
++ 	if (mm_check_opt(&ipt, &opt) < 0)
++ 		return 1;
++ 
++-	if (argc == optind || fp_help == stdout) {
+++	if (argc == mm_optind || fp_help == stdout) {
++ 		fprintf(fp_help, "Usage: minimap2 [options] <target.fa>|<target.idx> [query.fa] [...]\n");
++ 		fprintf(fp_help, "Options:\n");
++ 		fprintf(fp_help, "  Indexing:\n");
++@@ -283,16 +283,16 @@
++ 		return fp_help == stdout? 0 : 1;
++ 	}
++ 
++-	if ((opt.flag & MM_F_SR) && argc - optind > 3) {
+++	if ((opt.flag & MM_F_SR) && argc - mm_optind > 3) {
++ 		fprintf(stderr, "[ERROR] incorrect input: in the sr mode, please specify no more than two query files.\n");
++ 		return 1;
++ 	}
++-	idx_rdr = mm_idx_reader_open(argv[optind], &ipt, fnw);
+++	idx_rdr = mm_idx_reader_open(argv[mm_optind], &ipt, fnw);
++ 	if (idx_rdr == 0) {
++-		fprintf(stderr, "[ERROR] failed to open file '%s'\n", argv[optind]);
+++		fprintf(stderr, "[ERROR] failed to open file '%s'\n", argv[mm_optind]);
++ 		return 1;
++ 	}
++-	if (!idx_rdr->is_idx && fnw == 0 && argc - optind < 2) {
+++	if (!idx_rdr->is_idx && fnw == 0 && argc - mm_optind < 2) {
++ 		fprintf(stderr, "[ERROR] missing input: please specify a query file to map or option -d to keep the index\n");
++ 		mm_idx_reader_close(idx_rdr);
++ 		return 1;
++@@ -318,13 +318,13 @@
++ 		if (mm_verbose >= 3)
++ 			fprintf(stderr, "[M::%s::%.3f*%.2f] loaded/built the index for %d target sequence(s)\n",
++ 					__func__, realtime() - mm_realtime0, cputime() / (realtime() - mm_realtime0), mi->n_seq);
++-		if (argc != optind + 1) mm_mapopt_update(&opt, mi);
+++		if (argc != mm_optind + 1) mm_mapopt_update(&opt, mi);
++ 		if (mm_verbose >= 3) mm_idx_stat(mi);
++ 		if (!(opt.flag & MM_F_FRAG_MODE)) {
++-			for (i = optind + 1; i < argc; ++i)
+++			for (i = mm_optind + 1; i < argc; ++i)
++ 				mm_map_file(mi, argv[i], &opt, n_threads);
++ 		} else {
++-			mm_map_file_frag(mi, argc - (optind + 1), (const char**)&argv[optind + 1], &opt, n_threads);
+++			mm_map_file_frag(mi, argc - (mm_optind + 1), (const char**)&argv[mm_optind + 1], &opt, n_threads);
++ 		}
++ 		mm_idx_destroy(mi);
++ 	}
+diff --git a/docs/sources/Functions.rst b/docs/sources/Functions.rst
+index 6ec20c9..dccc2b2 100644
+--- a/docs/sources/Functions.rst
++++ b/docs/sources/Functions.rst
+@@ -402,6 +402,8 @@ Arguments by value:
+ +-------------------+-----------------+------------+----------------+
+ | discard_zeros     | Bool            | no         | false          |
+ +-------------------+-----------------+------------+----------------+
++| reference         | String          | no         | ""             |
+++-------------------+-----------------+------------+----------------+
+ 
+ 
+ If the features to count are ``['seqname']``, then each read will be assigned
+diff --git a/docs/sources/methods.md b/docs/sources/methods.md
+index 0558e63..ededb7c 100644
+--- a/docs/sources/methods.md
++++ b/docs/sources/methods.md
+@@ -10,6 +10,16 @@ They can also take arguments
+     mapped = select(mapped) using |mr|:
+         mr = mr.filter(min_match_size=30)
+ 
++## Short reads
++
++Short reads have the following methods:
++
++- `avg_quality()`: the average quality (as a double)
++- `fraction_at_least(q)`: the fraction of bases of quality greater or equal to `q`
++- `n_to_zero_quality()`: transform the quality scores so that any `N` (or `n`)
++  bases in the sequence get a quality of zero.
++
++
+ ## Mapped reads
+ 
+ Mapped reads contain several methods. *None of these methods changes its
+diff --git a/docs/sources/tutorial-gut-metagenomics.rst b/docs/sources/tutorial-gut-metagenomics.rst
+index b4e3046..e22e092 100644
+--- a/docs/sources/tutorial-gut-metagenomics.rst
++++ b/docs/sources/tutorial-gut-metagenomics.rst
+@@ -56,8 +56,8 @@ The rest of this tutorial is an explanation of the steps in this script.
+ 
+ To run ngless, we need write a script. We start with a few imports::
+ 
+-    ngless "0.0"
+-    import "parallel" version "0.0"
++    ngless "0.7"
++    import "parallel" version "0.6"
+     import "mocat" version "0.0"
+     import "motus" version "0.1"
+     import "igc" version "0.0"
+@@ -93,7 +93,7 @@ First, we load the data (the FastQ files)::
+ 
+ And, now, we preprocess the data::
+ 
+-    preprocess(input, keep_singles=False) using |read|:
++    input = preprocess(input, keep_singles=False) using |read|:
+         read = substrim(read, min_quality=25)
+         if len(read) < 45:
+             discard
+@@ -183,8 +183,9 @@ run it from the command line::
+ 
+     $ ngless process.ngl
+ 
+-You also need to run it once for each sample. However, this can be done in
+-parallel, taking advantage of high performance computing clusters.
++.. note:: **You need to run this script once for each sample**. However, this
++    can be done in parallel, taking advantage of high performance computing
++    clusters.
+ 
+ 
+ Full script
+@@ -192,8 +193,8 @@ Full script
+ 
+ Here is the full script::
+ 
+-    ngless "0.0"
+-    import "parallel" version "0.0"
++    ngless "0.7"
++    import "parallel" version "0.6"
+     import "mocat" version "0.0"
+     import "motus" version "0.1"
+     import "igc" version "0.0"
+@@ -203,7 +204,7 @@ Here is the full script::
+ 
+     input = load_mocat_sample(sample)
+ 
+-    preprocess(input, keep_singles=False) using |read|:
++    input = preprocess(input, keep_singles=False) using |read|:
+         read = substrim(read, min_quality=25)
+         if len(read) < 45:
+             discard
+diff --git a/docs/sources/tutorial-ocean-metagenomics.rst b/docs/sources/tutorial-ocean-metagenomics.rst
+index 8d26d8f..8a4d428 100644
+--- a/docs/sources/tutorial-ocean-metagenomics.rst
++++ b/docs/sources/tutorial-ocean-metagenomics.rst
+@@ -56,8 +56,8 @@ The rest of this tutorial is an explanation of the steps in this script.
+ 
+ To run ngless, we need write a script. We start with a few imports::
+ 
+-    ngless "0.0"
+-    import "parallel" version "0.0"
++    ngless "0.7"
++    import "parallel" version "0.6"
+     import "mocat" version "0.0"
+     import "omrgc" version "0.0"
+ 
+@@ -91,7 +91,7 @@ First, we load the data (the FastQ files)::
+ 
+ And, now, we preprocess the data::
+ 
+-    preprocess(input, keep_singles=False) using |read|:
++    input = preprocess(input, keep_singles=False) using |read|:
+         read = substrim(read, min_quality=25)
+         if len(read) < 45:
+             discard
+@@ -137,8 +137,8 @@ run it from the command line::
+     $ ngless process.ngl
+ 
+ Note that we need a large amount (ca. 64GB) of RAM memory to be able to use the
+-OM-RGC. You also need to run it once for each sample. However, this can be done
+-in parallel, taking advantage of high performance computing clusters.
++OM-RGC. **You also need to run it once for each sample.** However, this can be
++done in parallel, taking advantage of high performance computing clusters.
+ 
+ 
+ Full script
+diff --git a/docs/sources/whatsnew.rst b/docs/sources/whatsnew.rst
+index db8df5c..cc2a339 100644
+--- a/docs/sources/whatsnew.rst
++++ b/docs/sources/whatsnew.rst
+@@ -2,6 +2,44 @@
+ What's New (History)
+ ====================
+ 
++IN DEVELOPMENT (WILL BECOME 0.8)
++--------------------------------
++
++Incompatible changes
++~~~~~~~~~~~~~~~~~~~~
++
++- Added an extra field to the FastQ statistics, with the fraction of basepairs
++  that are not ATCG. This means that uses of `qcstats
++  <Functions.hml#qcstats>`__ must use an up-to-date version declaration.
++
++User-visible improvements
++~~~~~~~~~~~~~~~~~~~~~~~~~
++
++- Support for `minimap2 <https://github.com/lh3/minimap2>`__ as alternative
++  mapper. Import the ``minimap2`` module and specify the ``mapper`` when
++  calling `map <Functions.html#map>`__. For example::
++
++    ngless '0.8'
++    import "minimap2" version "1.0"
++
++    input = paired('sample.1.fq', 'sample.2.fq', singles='sample.singles.fq')
++    mapped = map(input, fafile='ref.fna', mapper='minimap2')
++    write(mapped, ofile='output.sam')
++
++- Added the ``</>`` operator. This can be used to concatenate filepaths. ``p0
++  </> p1`` is short for ``p0 + "/" + p1`` (except that it avoids double forward
++  slashes).
++
++- Fixed a bug in `select <Functions.html#select>`__ where in some edge cases,
++  the sequence would be incorrectly omitted from the result. Given that this is
++  a rare case, if a version prior to 0.8 is specified in the version header,
++  the old behaviour is emulated.
++
++Internal improvements
++~~~~~~~~~~~~~~~~~~~~~
++
++- Faster `collect() <Functions.html#collect>`__
++
+ Version 0.7.1
+ -------------
+ 
+diff --git a/package.yaml b/package.yaml
+index d269ffb..e091f1a 100644
+--- a/package.yaml
++++ b/package.yaml
+@@ -26,7 +26,7 @@ dependencies:
+   - bytestring
+   - bytestring-lexing
+   - optparse-applicative
+-  - conduit
++  - conduit >= 1.3
+   - conduit-algorithms >=0.0.3.0
+   - conduit-extra >=1.1.12
+   - conduit-combinators
+@@ -40,6 +40,7 @@ dependencies:
+   - either
+   - errors >=2.1
+   - extra >=1.4
++  - exceptions
+   - filemanip >=0.3.6
+   - filepath >=1.3
+   - file-embed >=0.0.8
+@@ -72,6 +73,8 @@ dependencies:
+   - transformers
+   - transformers-base
+   - unix-compat
++  - unliftio
++  - unliftio-core
+   - vector >=0.11
+   - vector-algorithms
+   - yaml
+diff --git a/run-benchmarks.sh b/run-benchmarks.sh
+new file mode 100755
+index 0000000..eecb423
+--- /dev/null
++++ b/run-benchmarks.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++set -e
++
++shopt -s nullglob
++
++if ! test -f test_samples/functional.map; then
++    gunzip --keep test_samples/functional.map.gz
++fi
++if ! test -f test_samples/sample.sam; then
++    gunzip --keep test_samples/sample.sam
++fi
++if ! test -f test_samples/merge/sp_sample_127; then
++    echo "Generating fake profiles for merging"
++    (cd test_samples/merge && python generate.py)
++fi
++exec stack bench --benchmark-arguments "--output bench.html"
+diff --git a/stack.yaml b/stack.yaml
+index 285fc37..a4ed298 100644
+--- a/stack.yaml
++++ b/stack.yaml
+@@ -4,13 +4,16 @@
+ 
+ # NOTE: When bumping stack's lts version, remember to rebuild and upload the
+ # docker images (build-scripts/docker_bases/) used by GitLab
+-resolver: lts-10.4
++resolver: nightly-2018-05-02
+ compiler-check: newer-minor
+ 
+ 
+ # Packages to be pulled from upstream that are not in the resolver (e.g., acme-missiles-0.3)
+ extra-deps:
+     - regex-1.0.1.3
++    - inline-c-0.6.0.6
++    - inline-c-cpp-0.2.1.0
++
+ allow-newer: true
+ 
+ # Override default flag values for local packages and extra-deps
+diff --git a/test_samples/.gitignore b/test_samples/.gitignore
+index ecf4dbf..6615403 100644
+--- a/test_samples/.gitignore
++++ b/test_samples/.gitignore
+@@ -1,3 +1,4 @@
+ sample.fq
+ sample.sam
+ sample.gtf
++functional.map
+diff --git a/test_samples/functional.map.gz b/test_samples/functional.map.gz
+new file mode 100644
+index 0000000..87115de
+Binary files /dev/null and b/test_samples/functional.map.gz differ
+diff --git a/test_samples/merge/.gitignore b/test_samples/merge/.gitignore
+new file mode 100644
+index 0000000..33bfe7c
+--- /dev/null
++++ b/test_samples/merge/.gitignore
+@@ -0,0 +1,2 @@
++sample_*
++sp_sample_*
+diff --git a/test_samples/merge/generate.py b/test_samples/merge/generate.py
+new file mode 100644
+index 0000000..131c45d
+--- /dev/null
++++ b/test_samples/merge/generate.py
+@@ -0,0 +1,12 @@
++from random import random
++for sparse in [False, True]:
++    n = 'sp_sample_{}' if sparse else 'sample_{}'
++    kn_features = (64 if sparse else 8)
++    for s in range(128):
++        with open(n.format(s), 'wt') as output:
++            output.write('\tsample_{}\n'.format(s))
++            for f in range(1024*kn_features):
++                if random() < .01:
++                    output.write("Feature_{}\t{}\n".format(f, random()*1000))
++                elif not sparse:
++                    output.write("Feature_{}\t0\n".format(f))
+diff --git a/tests/argv/argv.ngl b/tests/argv/argv.ngl
+index d9eb178..59cd8d7 100644
+--- a/tests/argv/argv.ngl
++++ b/tests/argv/argv.ngl
+@@ -1,3 +1,3 @@
+-ngless "0.0"
++ngless "0.8"
+ print(ARGV[0])
+ print("\n")
+diff --git a/tests/as-reads-3/as_reads.ngl b/tests/as-reads-3/as_reads.ngl
+index f528e83..05a66a4 100644
+--- a/tests/as-reads-3/as_reads.ngl
++++ b/tests/as-reads-3/as_reads.ngl
+@@ -1,4 +1,4 @@
+-ngless '0.7'
++ngless '0.8'
+ write(as_reads(samfile('input.sam')),
+         ofile='output.fq')
+ 
+diff --git a/tests/as_reads-bam/as_reads.ngl b/tests/as_reads-bam/as_reads.ngl
+index 7cfbce9..9eb9d3c 100644
+--- a/tests/as_reads-bam/as_reads.ngl
++++ b/tests/as_reads-bam/as_reads.ngl
+@@ -1,3 +1,3 @@
+-ngless '0.0'
++ngless '0.8'
+ write(as_reads(samfile('input.bam')),
+         ofile='output.fq')
+diff --git a/tests/as_reads/as_reads.ngl b/tests/as_reads/as_reads.ngl
+index 7e3a8ed..9b7e90b 100644
+--- a/tests/as_reads/as_reads.ngl
++++ b/tests/as_reads/as_reads.ngl
+@@ -1,4 +1,4 @@
+-ngless '0.0'
++ngless '0.8'
+ input = fastq('sample.fq')
+ mapped = map(input,reference='sacCer3')
+ reads = as_reads(mapped)
+diff --git a/tests/as_reads_encoding/as_reads.ngl b/tests/as_reads_encoding/as_reads.ngl
+index 8c0d7bd..6e3005c 100644
+--- a/tests/as_reads_encoding/as_reads.ngl
++++ b/tests/as_reads_encoding/as_reads.ngl
+@@ -1,4 +1,4 @@
+-ngless "0.0"
++ngless "0.8"
+ input = as_reads(samfile('sanger.encoded.sam'))
+ input = preprocess(input, keep_singles=True) using |read|:
+     read = substrim(read, min_quality=25)
+diff --git a/tests/as_reads_regression/as_reads.ngl b/tests/as_reads_regression/as_reads.ngl
+index 64a0179..0fc342f 100644
+--- a/tests/as_reads_regression/as_reads.ngl
++++ b/tests/as_reads_regression/as_reads.ngl
+@@ -1,3 +1,3 @@
+-ngless "0.6"
++ngless "0.8"
+ 
+ write(as_reads(samfile('test.sam')), ofile='output.fq')
+diff --git a/tests/assemble-gp/assemble-gp.ngl b/tests/assemble-gp/assemble-gp.ngl
+index 4879317..0d6dd33 100644
+--- a/tests/assemble-gp/assemble-gp.ngl
++++ b/tests/assemble-gp/assemble-gp.ngl
+@@ -1,4 +1,4 @@
+-ngless "0.6"
++ngless "0.8"
+ 
+ input = fastq('sample.fq.gz')
+ write(orf_find(assemble(input),
+diff --git a/tests/assemble/assemble.ngl b/tests/assemble/assemble.ngl
+index dc873f6..b0ee1a0 100644
+--- a/tests/assemble/assemble.ngl
++++ b/tests/assemble/assemble.ngl
+@@ -1,4 +1,4 @@
+-ngless "0.0"
++ngless "0.8"
+ 
+ input = fastq('sample.fq.gz')
+ write(assemble(input), ofile='output.fna')
+diff --git a/tests/grouped/expected.fqstats.tsv b/tests/grouped/expected.fqstats.tsv
+index 235f8b2..f0bb791 100644
+--- a/tests/grouped/expected.fqstats.tsv
++++ b/tests/grouped/expected.fqstats.tsv
+@@ -6,6 +6,7 @@
+ 0:minSeqLen	40
+ 0:maxSeqLen	177
+ 0:gcContent	0.38936781609195403
++0:nonATCGFraction	8.547008547008548e-3
+ 1:file	split1.fq
+ 1:encoding	Sanger (33 offset)
+ 1:numSeqs	2
+@@ -13,6 +14,7 @@
+ 1:minSeqLen	78
+ 1:maxSeqLen	177
+ 1:gcContent	0.3187250996015936
++1:nonATCGFraction	1.568627450980392e-2
+ 2:file	split2.fq
+ 2:encoding	Sanger (33 offset)
+ 2:numSeqs	8
+@@ -20,3 +22,4 @@
+ 2:minSeqLen	40
+ 2:maxSeqLen	83
+ 2:gcContent	0.42921348314606744
++2:nonATCGFraction	4.4742729306487695e-3
+diff --git a/tests/grouped/grouped.ngl b/tests/grouped/grouped.ngl
+index cc62c1d..1e05156 100644
+--- a/tests/grouped/grouped.ngl
++++ b/tests/grouped/grouped.ngl
+@@ -1,4 +1,4 @@
+-ngless '0.6'
++ngless '0.8'
+ one = fastq('sample.fq')
+ mapped = map(one,reference='sacCer3')
+ write(mapped, ofile='one.sam')
+@@ -7,6 +7,7 @@ split1 = fastq('split1.fq')
+ split2 = fastq('split2.fq')
+ split = group([split1, split2], name='sample')
+ mapped = map(split, reference='sacCer3')
++mapped = select(mapped, drop_if=[{mapped}])
+ write(mapped, ofile='split.sam')
+ 
+ write(qcstats({fastq}), ofile='output.fqstats.tsv')
+diff --git a/tests/map-minimap2/.gitignore b/tests/map-minimap2/.gitignore
+new file mode 100644
+index 0000000..411c2f1
+--- /dev/null
++++ b/tests/map-minimap2/.gitignore
+@@ -0,0 +1,2 @@
++ref.4G.fna.idx
++ref.fna.mm2.idx
+diff --git a/tests/map-minimap2/expected.sam b/tests/map-minimap2/expected.sam
+new file mode 100644
+index 0000000..3ad703c
+--- /dev/null
++++ b/tests/map-minimap2/expected.sam
+@@ -0,0 +1,8 @@
++@SQ	SN:A	LN:2556
++@SQ	SN:B	LN:3437
++@SQ	SN:C	LN:11798
++@SQ	SN:D	LN:3620
++@PG	ID:minimap2	PN:minimap2	VN:2.9-r720	CL:minimap2 -t 1 -a ref.fna sample.1.fq sample.2.fq
++ReadP	0	A	189	38	80M	*	0	0	CTCGAACCTCCAATCTTCGGATCCGAAGTCCGACGCCCCCGCGTCGGATGCGTTGTTACCACTGCTTTTGGTATCATTGA	HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH	NM:i:0	ms:i:160	AS:i:160	nn:i:0	tp:A:P	cm:i:8	s1:i:62	s2:i:0	dv:f:0.0079
++ReadP	0	A	69	49	80M	*	0	0	TATATATATATTTCTTGTAATTTGTTGGAATACGAGAACATCGTCAATAATATATCGTATGAATTGAACCACACGGCACA	HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH	NM:i:0	ms:i:160	AS:i:160	nn:i:0	tp:A:P	cm:i:9	s1:i:68	s2:i:0	dv:f:0.0070
++readS	0	C	35	50	80M	*	0	0	TCTTGGGAACCTACAGAACTGGTTATTGGTGTCGTGGAACCTCTTACTGCTTTCAATACACGATTAGTAATCAACTGTTT	HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH	NM:i:0	ms:i:160	AS:i:160	nn:i:0	tp:A:P	cm:i:12	s1:i:69	s2:i:0	dv:f:0.0053
+diff --git a/tests/map-minimap2/map-minimap2.ngl b/tests/map-minimap2/map-minimap2.ngl
+new file mode 100644
+index 0000000..0abc1d9
+--- /dev/null
++++ b/tests/map-minimap2/map-minimap2.ngl
+@@ -0,0 +1,6 @@
++ngless '0.8'
++import "minimap2" version "1.0"
++
++input = paired('sample.1.fq', 'sample.2.fq', singles='sample.singles.fq')
++mapped = map(input, fafile='ref.fna', mapper='minimap2')
++write(mapped, ofile='output.sam')
+diff --git a/tests/map-minimap2/ref.fna b/tests/map-minimap2/ref.fna
+new file mode 120000
+index 0000000..538d122
+--- /dev/null
++++ b/tests/map-minimap2/ref.fna
+@@ -0,0 +1 @@
++../parallel/ref.fna
+\ No newline at end of file
+diff --git a/tests/map-minimap2/sample.1.fq b/tests/map-minimap2/sample.1.fq
+new file mode 100644
+index 0000000..5c98f9d
+--- /dev/null
++++ b/tests/map-minimap2/sample.1.fq
+@@ -0,0 +1,4 @@
++@ReadP
++TATATATATATTTCTTGTAATTTGTTGGAATACGAGAACATCGTCAATAATATATCGTATGAATTGAACCACACGGCACA
+++
++HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH
+diff --git a/tests/map-minimap2/sample.2.fq b/tests/map-minimap2/sample.2.fq
+new file mode 100644
+index 0000000..765faf9
+--- /dev/null
++++ b/tests/map-minimap2/sample.2.fq
+@@ -0,0 +1,4 @@
++@ReadP
++CTCGAACCTCCAATCTTCGGATCCGAAGTCCGACGCCCCCGCGTCGGATGCGTTGTTACCACTGCTTTTGGTATCATTGA
+++
++HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH
+diff --git a/tests/map-minimap2/sample.singles.fq b/tests/map-minimap2/sample.singles.fq
+new file mode 100644
+index 0000000..fa6bd8c
+--- /dev/null
++++ b/tests/map-minimap2/sample.singles.fq
+@@ -0,0 +1,4 @@
++@readS
++TCTTGGGAACCTACAGAACTGGTTATTGGTGTCGTGGAACCTCTTACTGCTTTCAATACACGATTAGTAATCAACTGTTT
+++
++HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH
+diff --git a/tests/mapstats/mapstats.ngl b/tests/mapstats/mapstats.ngl
+index e7f727d..8466da6 100644
+--- a/tests/mapstats/mapstats.ngl
++++ b/tests/mapstats/mapstats.ngl
+@@ -1,4 +1,4 @@
+-ngless "0.0"
++ngless "0.8"
+ 
+ mapped = samfile("input.sam")
+ write(mapstats(mapped), ofile="output.txt")
+diff --git a/tests/merge-sams/merge.ngl b/tests/merge-sams/merge.ngl
+index 11f7ed0..14b7010 100644
+--- a/tests/merge-sams/merge.ngl
++++ b/tests/merge-sams/merge.ngl
+@@ -1,4 +1,4 @@
+-ngless "0.6"
++ngless "0.8"
+ 
+ write(__merge_samfiles(['input1.sam', 'input2.sam']),
+       ofile='output.merged.sam')
+diff --git a/tests/mocat_sample_bz2/mocat.ngl b/tests/mocat_sample_bz2/mocat.ngl
+index 95f15bb..17aa7a5 100644
+--- a/tests/mocat_sample_bz2/mocat.ngl
++++ b/tests/mocat_sample_bz2/mocat.ngl
+@@ -1,10 +1,10 @@
+-ngless "0.0"
++ngless "0.8"
+ import "mocat" version "0.0"
+ 
+ input = load_mocat_sample('sample')
+ 
+ trim = 3
+-preprocess(input) using |read|:
++input = preprocess(input) using |read|:
+    read = read[trim:]
+    if len(read) < 10:
+        discard
+diff --git a/tests/motus/motus.ngl b/tests/motus/motus.ngl
+index bea076d..fc18f5f 100644
+--- a/tests/motus/motus.ngl
++++ b/tests/motus/motus.ngl
+@@ -1,4 +1,4 @@
+-ngless "0.0"
++ngless "0.8"
+ import "motus" version "0.1"
+ 
+ input = paired('input.1.fq.gz', 'input.2.fq.gz')
+diff --git a/tests/parallel/ref.fna b/tests/parallel/ref.fna
+index dce382c..36207dd 100644
+--- a/tests/parallel/ref.fna
++++ b/tests/parallel/ref.fna
+@@ -1,8 +1,8 @@
+-> A
++>A
+ TTTTTTTTTTTTTTTTTTTTTTTTTTTNTTTNTTTNTTTNTTTATTTATTTATTTATTATTATATATATATATATATATTTCTTGTAATTTGTTGGAATACGAGAACATCGTCAATAATATATCGTATGAATTGAACCACACGGCACATATTTGAACTTGTTCGTGAAATTTAGCGAACCTGGCAGGACTCGAACCTCCAATCTTCGGATCCGAAGTCCGACGCCCCCGCGTCGGATGCGTTGTTACCACTGCTTTTGGTATCATTGATATTCATTCTGGAGAACGATGGAACATACAAGAATTGTGTTAAGACCTGCATAAGGGCCTGTGTACTTATCATCTCTAGGTGACGCGCGGCATGCAACTGTGTGACATGAGTGATTCCATCGGACCATGGATGGCTGACCAGATCCAGATGTGATCTATGGCAGGACATATGTGGNGGTAGACCAGCATACACCGGTATAGACCTGTATAGACCACTATAGACCGGTATAGACCGGCATAGACCGGTATAGACTACTACACAGACCGGCATAGACCGGTATAGACCACTACACACCAGTATAGACCGCTATAGTTAATTGTTCTTCAGTCAATCAATAATATATATCGTAACTTAAAAAANAAGTATACTGACCATACTAGTAGTACTGGTATACTGGTATACTGGTCAGTACTGGTATACTGGTGTATACTGGATAGACCGGTATAGACCGGCATAGACCGGTATAGACCACTACACACCAGTATAGACCAGTATAGACTGGTATAGGCCGGTACCAGATACCAGATGTATCTATGGCAGGACATATGTGGNGTTTTTTTTTNTNTNTNTATATATATATATATATATATATATATATATATATATATATATATATATATATATATAAGAGACATCAGAGTGGATGTCACGAGACGAACCAATTAAGCGGATCGATGTGAGGTCAATGAGCAATTCAGAACGCGGACCGACGAGGTTCTTGTACAGCTTGGTCAACCTGTCCTCTGCCTCTGCCATCATGGGCAACCCAACGTCAAGGCACACAGGGGATAGGTATACTGGTCTATACAGGTCTATACCGGTGTATGCTGGCCTATACCAGTCTATACTGGTCTATACTGGTGTTTTTTTAGGGTTACTTTCTTCTGCTATATTTTTAAATTTTCAATTTTTATAGCATTTAGTATTTTTCATTATTAATTTTTATTCGTAGTTCATACCCTCGTTATCGTTATGATTTAATAATAAGTTTATTTTGATTTAAACTTTTACCAATCTCTTTAATTATATTGTGTTTTTTGGTTTCAACATTTACTTAAATCGTAAGTAATGCTCCATAAAGTATGTACAAGCTCCCACCAATGTGTTCTATTGTACAAGCTTCCACCAACATGTTCCATCACATTCTACCATAGACTTACGGCTGGCTTTGAGTAGCTTTCAGTTCAAAGTGAAACATGTAAACATATTATATACATGAACTTACATATACAAAGGTGTGAGCAGTGGTAACAACGCATCCGACGCTCATTGTGATCATTATTAACTCTTAACCCGTACCTTGTTTCACATGTTGCCTTCTTAACTCTCCTAGATGCTCTTCATTACCAACAACACTACGGTTCAATAACTCAGAATTATCATTGGCTGTCTTGTACTTAACAATTCTTGTGTNTAACATATAGACTAGACAGACAGTATAGACCAGTACAGACCAGTATAGACCAGTACAGACCACTATAGACCAGTATACACCAGTATAGACCAGGACAGACAGACTGGTATAGGCCAGCATACACCGGTATAGACCACTACACACCAGTATAGACCTCGTTTCAGATAGTGAAGATCTTTCATAAGTTTGTGTGTTTACTTTTGTTTGTTTATTTCTACAGTATGATGTAGATTTCTTGTTGTGAAGCAGCTATACGTGGCATACATGTATTAAATTAAGGTGTTAGAGTGGTTTTTTACAATACCGTATTATTGGTATCATTGATATTCATTCTGGAGAACGATGGAACATACAAGAATTGTGTTAAGACCTGCATAAGGGGTAATTTTCACAGGCACAGAAAACTGAATCAGTAGATAACGAGGGAGAATGAATTGTCATGAAAATTGGGGTTGATTTTATGTACCTCTTGGGACAACTTTTAAAAGCTATTTTACCAAGTATTTTGTAAATGCTAATTTTTAGGACTCTACTAGTTGGCATACAAAAATATATAAGTATGACATTTTACCCTCTCATAATCAGTGCTTTTTGGAAATTTCCATCATCCTCAAGTTATACTGGTCTATACAGGTCTATACCGGTGTATGCTGGCCTATACCAGTCTATACTGGTCTATACTGGTGTGCCTGCTTTGTCACCTCAGAGCATTTATTTCCATGTGAATTACCTGATATGTTCTTCAATTAATACACTTCCTGATTCACAATGTTATTTACATAGACAAGTCATTCTCTATTCCCCTCCCTCTACTAGCAGTGTACACGCATCCGTACTTTTTTTTTNTTTNTTTNTTTNTTTNTTTNTTTNTTT
+-> B
++>B
+ TGCGAGGTGAGGTGTACGAGCCTCCGGTCGATGATAATGGCCACACAACCNCCTTACTTGTTAACGTAAGTTGTGGAGCATTATTCTACTTCTTGACTCACTGTATAATTAGACCTATGTAGAGTACCAGAGCTCATGCTGGAGCCAAACCCTCCTGAGTGCAAAGGCTGAAGCCTGAATTGGAATACCAGTTATCACGTTAATTCTTGGTTATAATATACAATTTGAATCGAGGAGTTCAAGGCACACAGGGATAGGTTTTTTTTTTTTTTTTTTTTTTTTTTNTTNTTNTTNTTNTTNTTNTTNTTTTTTCTCTTCAGTTGCCCTTCCCGATTCATCATTCCAAAATTCAATTTTCTTTTCCGATGACGTGTAAATCTAGCTTCAGAATCCAGACAATTTCAGCTTTTTTCAATATTTATTTTAATTATTTCTTGATCTTTTAAATTTATTTATTCTAATTTATATTATTGGTTCAATAGTAATAATGAAAAGAAATAGTAAGTTAAAAAAAGTAAAAAACGGATTCAATCCGTAGGTGTTAGCCTTCGGTATTATGAATGGTCATTCATGGCTATTCGACAATGGGTGGTGTGGCCATTGATCATCGATCAGAGGCTCATACCTGCTACAGCGCAGGTGTCTTCCATTACACCAAGGAGATATTCTGAGTGTGTAATTCCCTTCGACTAATCATTGTATGTTAATAATTGTATGTTCCGGTCATCTTCACATCCATGTTGAACATTATATACTGAAGTCAGAAGCAATCCAATGAATAACAATCAATTAATACAGGTCGGATGCGTTGTTACCACTGCTTGTTACTGATAACGTGAGTGCTGGTATTGATTTCCTGTGTGTGTTGCCACAGCATTAAGGGCATTTACCTTGCAGTTTACTAAACACTCTGAAATATTCCAAGCTTCATATTAACCCTGTCAACGTAACGATTTTATGAACATTATTATATTGTCGAATTCCTACTGACATTATAACTATATGGGAGCTTAACTTTATAAGGAAATGTATTTTGACACTGATATCTTATTAAAGTATTCTGATTACCAAAACAAACAAATAAGTACGGATGCGTTGTTACCACTGCTTGTACCTAGCTGAGATGGTCTGATGGTCTGTGACAGCTGACATGAGAGGATTGATACAGTGATTTAATGCTTATTGGAAGTTATTGGAACTGAACAATTCTCTTCAACAAGTTATACATTTGAACGGAGACGACGACTGTTGGCTGCCAAGATGAATGAACGTGGTGGACATGGACAGTATTGGCCGTCACGACCTGGAATTCCTGGGCCTCCTGGAACTCCAATTGTTCCTGGTTGTCCGGGAGCTCCGCGTGGTCCTGGAACACCTGGAATTCCTTCACTTCCATTTTCCCCATCAATTCCTTTTGTCCAGGCTCTCCATTGATTCCAACTTTTCCTGGACGTCCTGGTTTCAAGAATGAGAACCGACTCTGTGACAGATTCCTGCTGTAGCAGTGAGTATTCATATTGTAGCTGTGATTGCGTCAACAACGAAAGTTGCCGAGGTTCCACAAATCGGGTACAGTCTTGATGAGCTCAATGCTAAAGGGAGGAACCGAATGGAGAGTTGCCAGATACACTGCAATTGCGATGTTCTGGGGAATTTGGGGAGCGCTGCTTGCAGGCTCAATCCTTATCATTGTGCTCAATAATCACGACGTTGCGAGCACTACTGCCGCTCCAAACCACAACAACCACCAACGGTATACTGACCATACTAGTTAGTACTGGTTATACTGGTTATACTGGTCAGTACTGGTTATACTGGTGTATACTGGTTATACTGGTCCATACTGGTTATACTGGTGTATACTGGTTTCTCATTACAATTGACATTAACCATTTCTCTGAATCATGCTCATTATTGAGCCACATTCATAATAAAGCTTTAATAAGAACAAAATGAGGATATGCAATCAATTGAACATCAATTCTCAGGAATTCAATGCAATTCATTCATATCTTATATATTGTAGAGTATATCTATTTTCCTGTTTACATCTGTTTCACTTAATTTCAAGATGAATTCGTGATTGGTCAAGTGGTGCATTCTTCCAATAATTCCTACCATCTTGCTTGTTTACGTGTGACGAGTGTAATGTTCATCTAAATTCTCAGATTGCAAGCAGTGGTAACAACGCATCCGACGCGGAGCACAATCAGGTGTGGATCGGTGCACGTTACCTAGCTTGAAGATGGTCTGATGGTTCTGTGAACAGCTGAACAATGAAGAGGATTGAATACAGTGGAATTAAACCAACAACATAAGAATGTACTAGCTGAGATGGTCTGATGGTCTGTGACAGCTGACATGAGAGGATTGATACAGTGGATTACCACACATAGATTGACATGCTTCATGAATCTGTTGGAAGCCTCGAGGAGAAATGGCTGCTGCTAGTCGCTTCAAAGAGCGACACAATGTTGCACTCTACTACCCACCACAATAAACGCACCCAGTGACTGAAACTTATTCCACATGCAATACATTTTATTTGTATCAATTTTCAAATCTCTAATGAACCGCACTGCTTTATAAATGTTGCTGCCAAGAGCATGCCACAGTGTCAGGTGACGGAATTGTATAGTGAGATAATGAGAGAGTACAGACTAGAAGCATCTAGGACGAAGTTTAATTACATTTTCTATATGCTTATTCTTTGGATTGCTAACCATCTAACTACCCAAATACTTAACAGCCTTGGCTTTAATTTCAAATTTAATAGACACATATGCAATTGATTTGTCCCATATAACTTTATTTTACAGAAATATTACAATACCGTATTATTGGTATCATTGATATTCATTTCTGGAGAACGATTTATATAATTAATAACAACATCATTCTCAAAGCGTCACTTGTGAACAAGTACAACGTAATGAACAAGAGAATCTGGCTGACATCGAATAACACGTTATACAGGGTGAAATGCCGACCGGTAATTGGTCATATCGCGGGCTGAACATGGCAGCCCGCGTCGGATGCGTTGTTACCACTGCTTTTTCAGTGCAATATAATTTATTCATACTAATTTAAGGATCTAAATACATAAATTTTCAGACTATAACAGAATTGAATAGTAGGTAATTGGGAAGAATTGGACAAAAGAATACTGTAGAAAATATAGTTCATAGAACTTGAATATTGAAATCATTGTACTTGAATCTAGATCTTCTGAACAATCGAGACCCCAGTCATTTCAGCTGGTTGAGGGAGTCCCATAATAGCGAGAACTGTTGGAGCAACATCACAAAGGGTCGGATGCGTTGTTACCACTGCTTAGACCGGCATAGACCGGTATAGACCACTACACACCAGTATAGACCGGTATAGACTGGTATAGGCCAGCATACACCGGTATAGACCAGTATAGACCGCTATAG
+-> C
++>C
+ TTGATAACACTGAAGAAGCTGGAGCTGTTAATTATCTTGGGAACCTACAGAACTGGTTATTGGTGTCGTGGAACCTCTTACTGCTTTCAATACACGATTAGTAATCAACTGTTTGACACATTGGTCGACGGTCGAGGCTTACGTCGATGACATCGTAGTCAAGACGAGAAGCCTCTGACCTCCTCTCCGACCTTGAACGACATTCCGGTGTCTCAAGGCACACAGGGAGTAGG
+ TTCCTATAGGATTCGCCGCATTATCAATCAACGGCACGTGCTTACTCGCCCAAGCAGTGATGATGGTGATGGTGGTCATGGTAATGATGGTGATAATGATGGTGGTGGTGATGGTAATGGTGGTGATGATGGTGGCGGCGGTATCGTGACTGGAACGTGACG
+ TTCCTGTTACATCTGTTCACTTAATTCAAGATGAATTCGTGATTGGTCAAGTGGTGCATTCTTCCAATAATTCCTACCATCTTGCTTGTTACGTGTGACGAGTGTAATGTTCATCTAAATTCTCAGATTGCGATGATCGTGATAAGGAATTCGACCGTAATTACGAGAACCAATTAGTCGATGATACATACGACACCGTACAATCATCCTGATCGTTGGAGCAGTGTGTGGTGTTATTGCACTTATCGCAACCAGCATTGGAGTGATCATCTCAGTCTATTGCTGTACCCGTAACAGGGATTATTGATTAATTGAACTTTGTGCGAATGAATTCTTTGT
+@@ -38,7 +38,7 @@ AGCAGTGGTAACAACGCAGAGTGTTAACGCGGTCAGTATAATATGTAAGGCCTTACTTAANAGTTGTTACCTAGCTTGAA
+ AGAGACATCAGAGTGGATGTCACGAGACGAACCAATTAAGACGGATCGATGTGAAGGTCAATGTTAATTGACAATCATTTACTAACTATTAACATCACAACCTCAAAGCTCTGAAAATGAGCTTCAAATTCAAACAATATTCAAGTAATTAAGAAATCAGCACTTCGAAATAGCAGCTTCAACTGCATTTCTGATTGTTGTCATGGCGACAGATTGATCTGCAGCTTTGATGATTCCAGTTCCACTCACGATCGCATTGGCTCCCGCGTCGGATGCGTTGTTACCACTGCTT
+ GTTGTGCGGACTGAACGACACTGCGGACTCTCAGGCGGAAGCGTGACTGCTCATACCTCTGGCTTGGGCGAGGAAGACCTGGAGCCCACCACTGAGTCCCCTCTGAGCAGCGTGGGCTCCCTACTCCGCATCAGTGAGTCGGATGCGTTGTTACCACTGCTTACTCCTCCACAAGGTCCGCAACAACGTCCTGAACCTCCACGGTCGCCTGTTCCTTCGTTGAGACTATTCAGGTCCACGCACTTGCGTTGTGTATTAAGCACTGAATTTATGTAGCACCGAATAATAATTCGCCTTAAAGTACGGATGCGTTGTTACCACTGCTT
+ TTTTAGTTTTAAAGAACATTCAAGAAGTTGGAATGTCACGAGACGAAAACCAAATTAAAGCGGATCGATGTGAAGGTCAAATGAAGCAAATTCAAG
+-> D
++>D
+ AGAAGACATTCAAGAAGTTGGAATGTCACGAGACGAACCAATTAAGCGGATCGATGTGAAGGTCAATGAGCAATTCAAGTTTACAGTAAACTTTGCGACGTCTCAACAATTCGATAAGGTGCTGTACCAAATGTCAAGATTATTATATTTTATTATTATTATAATTGACCCACCGGATAGCAGGAAAAGAGCAGACAAACATTAGGACGGGAGAACTCAGAAAGATTTTTTGACTTTAATTTGGACATTTGTGCTTATTGTAATGTGTTACGGCTCATATTACAGTAATAAAGCTGTCCTGATGTTTAAGAAAAAAAG
+ TTTTATAGTTTCATGAGAGGAAGGCAAGTCTAACGGTTAGGGTGCTAGTCCGGAACTCGGGAAACTCAGGTGCAGTTTCTAGCTCTGTTACAAAACTTCCTGCCTGATCAAGGCACACAGGGGATAGGTTCTCTTCAGTTGCCCTTCCCGATTCATCATTCCAAATTCAATTTCTTTCCGATGACGTGTAATCTAGCTTCAGAATCCAGACAATTTCAGCTTTTCAATATTTATTTAATTATTCTTGATCTTTAAATTATTATTCTAATTTATATTATTGGTTCAATAGTAATAATGAAAAGAATAGTAGTTTTACAAAAGTAAAACGGAATGCGTTGTTACCACTGCTT
+ TTTTCATGTCGTAATGTATATTTTAATGTAGGAGCTGGTGTAGTAATTTAGAGCAATAAATATCACACAGTGAAAATTTATCACAAACTAAATACAGTAACAAAAGAAAGAAAAGCTTATGTACACATTACTGAGGTCTTCACAATAAATTATAGTGTACAGTTCCATCACAGCGTATTTGTATACAAAGCTGGTAATGTGAACACTGAAAGGAATCTCTTATGTAAGTCTTTAATCTTGATTTAATAAAGTTTATACAGTATCAAATAATATCAAAAGTCTAAAAAACACAATGAGTTTTTATATCATGTTTATAAATTATTGTTTCATATACCATAAAAAAATAAGGTCGGATGCGTTGTTACCACTGCTTAGCGGTCAGCAACGATGAAGGTGCAGATGGATCTGATGAGCCAAGGCTAAGCGTACTGTGTTCGCTGAGGATGGTGCTCCAGCTGCTGCTGCCGCCGAGTAATTCATCTTTGTTGTAACAACCCAATACTCATTCTTNTT
+diff --git a/tests/parse_odd_corners/expression.ngl b/tests/parse_odd_corners/expression.ngl
+index acd34c1..e9df6b0 100644
+--- a/tests/parse_odd_corners/expression.ngl
++++ b/tests/parse_odd_corners/expression.ngl
+@@ -1,8 +1,8 @@
+ 
+ # Ngless used to choke if first line was not "ngless"
+-# Ignoring comments seems more natural & allows she-bang line
++# Ignoring comments seems more natural & allows having a she-bang line
+ 
+-ngless "0.0"
++ngless "0.8"
+ 
+ line0 = readlines('input.txt')[0]
+ print(line0)
+diff --git a/tests/paste/paste.ngl b/tests/paste/paste.ngl
+index f3ed343..26e947b 100644
+--- a/tests/paste/paste.ngl
++++ b/tests/paste/paste.ngl
+@@ -1,4 +1,4 @@
+-ngless "0.0"
++ngless "0.8"
+ import "parallel" version "0.6"
+ 
+ 
+diff --git a/tests/paste_regression/expected.txt b/tests/paste_regression/expected.txt
+new file mode 100644
+index 0000000..b129bf4
+--- /dev/null
++++ b/tests/paste_regression/expected.txt
+@@ -0,0 +1,49 @@
++	SAMEA2581908	SRX1670084
++0:file	data/SAMEA2581908/ERR527078_1.fastq.gz	data/SRX1670084/SRR3313101.pair.1.fq.gz
++0:encoding	Sanger (33 offset)	Sanger (33 offset)
++0:numSeqs	22539814	27096517
++0:numBasepairs	2253981400	3547007055
++0:minSeqLen	100	40
++0:maxSeqLen	100	141
++0:gcContent	0.44706368462560564	0.46381335263512746
++0:nonATCGFraction	8.998675854201815e-3	0.0
++1:file	data/SAMEA2581908/ERR527078_2.fastq.gz	data/SRX1670084/SRR3313101.pair.2.fq.gz
++1:encoding	Sanger (33 offset)	Sanger (33 offset)
++1:numSeqs	22539814	27096517
++1:numBasepairs	2253981400	3351008134
++1:minSeqLen	100	40
++1:maxSeqLen	100	139
++1:gcContent	0.44818560059129603	0.46344943786997084
++1:nonATCGFraction	1.99829492825451e-2	0.0
++2:file	preproc.lno9.pairs.1	data/SRX1670084/SRR3313101.single.fq.gz
++2:encoding	Sanger (33 offset)	Sanger (33 offset)
++2:numSeqs	7869064	2674646
++2:numBasepairs	685436719	247983565
++2:minSeqLen	45	40
++2:maxSeqLen	100	141
++2:gcContent	0.417193204089202	0.49771496348961675
++2:nonATCGFraction	0.0	0.0
++3:file	preproc.lno9.pairs.2	preproc.lno9.pairs.1
++3:encoding	Sanger (33 offset)	Sanger (33 offset)
++3:numSeqs	7869064	25224268
++3:numBasepairs	630086337	3246049442
++3:minSeqLen	45	45
++3:maxSeqLen	100	141
++3:gcContent	0.4173759063751925	0.46005533270001253
++3:nonATCGFraction	0.0	0.0
++4:file	preproc.lno9.singles	preproc.lno9.pairs.2
++4:encoding	Sanger (33 offset)	Sanger (33 offset)
++4:numSeqs	0	25224268
++4:numBasepairs	0	3040404337
++4:minSeqLen	9223372036854775807	45
++4:maxSeqLen	0	139
++4:gcContent	NaN	0.4590021596854471
++4:nonATCGFraction	NaN	0.0
++5:file	0	preproc.lno9.singles
++5:encoding	0	Sanger (33 offset)
++5:numSeqs	0	2015664
++5:numBasepairs	0	188141262
++5:minSeqLen	0	45
++5:maxSeqLen	0	141
++5:gcContent	0	0.4959799727504751
++5:nonATCGFraction	0	0.0
+diff --git a/tests/paste_regression/partial.SAMEA2581908.tsv.gz b/tests/paste_regression/partial.SAMEA2581908.tsv.gz
+new file mode 100644
+index 0000000..c15f42d
+Binary files /dev/null and b/tests/paste_regression/partial.SAMEA2581908.tsv.gz differ
+diff --git a/tests/paste_regression/partial.SRX1670084.tsv.gz b/tests/paste_regression/partial.SRX1670084.tsv.gz
+new file mode 100644
+index 0000000..c747675
+Binary files /dev/null and b/tests/paste_regression/partial.SRX1670084.tsv.gz differ
+diff --git a/tests/paste_regression/paste.ngl b/tests/paste_regression/paste.ngl
+new file mode 100644
+index 0000000..b0ea33c
+--- /dev/null
++++ b/tests/paste_regression/paste.ngl
+@@ -0,0 +1,5 @@
++ngless "0.7"
++import "parallel" version "0.6"
++
++__paste(['partial.SAMEA2581908.tsv.gz', 'partial.SRX1670084.tsv.gz'],
++    headers=['SAMEA2581908', 'SRX1670084'], ofile='output.txt')
+diff --git a/tests/preprocess/expected.endstrim.fq b/tests/preprocess/expected.endstrim.fq
+index af9e28e..b1e2181 100644
+--- a/tests/preprocess/expected.endstrim.fq
++++ b/tests/preprocess/expected.endstrim.fq
+@@ -6,3 +6,7 @@ aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
+ GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
+ +
+ ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
++@With_High_Quality_Ns
++GTCAGGACAAGAAAGACAANTCCAATTNACATT
+++
++aaabaa`]baaaaa_aab]a^^`b`aYaW]aba
+diff --git a/tests/preprocess/expected.endstrim31.fq b/tests/preprocess/expected.endstrim31.fq
+index e69de29..3f60b15 100644
+--- a/tests/preprocess/expected.endstrim31.fq
++++ b/tests/preprocess/expected.endstrim31.fq
+@@ -0,0 +1,4 @@
++@With_High_Quality_Ns
++GTCAGGACAAGAAAGACAANTCCAATTNACATT
+++
++aaabaa`]baaaaa_aab]a^^`b`aYaW]aba
+diff --git a/tests/preprocess/expected.fq b/tests/preprocess/expected.fq
+index 0cf8f65..edc0685 100644
+--- a/tests/preprocess/expected.fq
++++ b/tests/preprocess/expected.fq
+@@ -6,3 +6,7 @@ baa`]baaaaa_aab]D^^`b`aYDW]aba
+ AACACTACTTAGGCTTATAAGATCNGGTTGCGG
+ +
+ bbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
++@With_High_Quality_Ns
++AGGACAAGAAAGACAANTCCAATTNACATT
+++
++baa`]baaaaa_aab]a^^`b`aYaW]aba
+diff --git a/tests/preprocess/expected.substrim.fq b/tests/preprocess/expected.substrim.fq
+index eb71c8c..18b555b 100644
+--- a/tests/preprocess/expected.substrim.fq
++++ b/tests/preprocess/expected.substrim.fq
+@@ -6,3 +6,7 @@ aaabaa`]baaaaa_aab]
+ GGAAACACTACTTAGGCTTATAAGATC
+ +
+ ababbaaabaaaaa`]`ba`]`aaaaY
++@With_High_Quality_Ns
++GTCAGGACAAGAAAGACAANTCCAATTNACATT
+++
++aaabaa`]baaaaa_aab]a^^`b`aYaW]aba
+diff --git a/tests/preprocess/expected.substrim.n_to_zero_quality.fq b/tests/preprocess/expected.substrim.n_to_zero_quality.fq
+new file mode 100644
+index 0000000..3fabf4c
+--- /dev/null
++++ b/tests/preprocess/expected.substrim.n_to_zero_quality.fq
+@@ -0,0 +1,12 @@
++@IRIS:7:1:17:394#0/1
++GTCAGGACAAGAAAGACAA
+++
++aaabaa`]baaaaa_aab]
++@IRIS:7:1:17:800#0/1
++GGAAACACTACTTAGGCTTATAAGATC
+++
++ababbaaabaaaaa`]`ba`]`aaaaY
++@With_High_Quality_Ns
++GTCAGGACAAGAAAGACAA
+++
++aaabaa`]baaaaa_aab]
+diff --git a/tests/preprocess/preprocess.ngl b/tests/preprocess/preprocess.ngl
+index 8d3fd1d..ab53246 100644
+--- a/tests/preprocess/preprocess.ngl
++++ b/tests/preprocess/preprocess.ngl
+@@ -1,4 +1,4 @@
+-ngless '0.5'
++ngless '0.8'
+ input = fastq('sample.fq')
+ trim = 3
+ input = preprocess(input) using |read|:
+@@ -30,3 +30,13 @@ input = preprocess(input) using |read|:
+     if read.avg_quality() < 31.9:
+         discard
+ write(input, ofile='output.endstrim31.fq')
++
++
++input = fastq('sample.fq')
++input = preprocess(input) using |read|:
++    read = read.n_to_zero_quality()
++    read = substrim(read, min_quality=20)
++    if len(read) < 10:
++        discard
++write(input, ofile='output.substrim.n_to_zero_quality.fq')
++
+diff --git a/tests/preprocess/sample.fq b/tests/preprocess/sample.fq
+index ba80fa7..4c0b370 100644
+--- a/tests/preprocess/sample.fq
++++ b/tests/preprocess/sample.fq
+@@ -10,3 +10,7 @@ ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
+ TGAAAGAT
+ +IRIS:7:1:17:1479#0/1
+ __a_X]``
++@With_High_Quality_Ns
++GTCAGGACAAGAAAGACAANTCCAATTNACATT
+++
++aaabaa`]baaaaa_aab]a^^`b`aYaW]aba
+diff --git a/tests/preprocess3/expected.fqstats.tsv b/tests/preprocess3/expected.fqstats.tsv
+index cefd30f..cab11eb 100644
+--- a/tests/preprocess3/expected.fqstats.tsv
++++ b/tests/preprocess3/expected.fqstats.tsv
+@@ -6,6 +6,7 @@
+ 0:minSeqLen	8
+ 0:maxSeqLen	36
+ 0:gcContent	0.3918918918918919
++0:nonATCGFraction	3.896103896103896e-2
+ 1:file	sample2.fq
+ 1:encoding	Solexa (64 offset)
+ 1:numSeqs	3
+@@ -13,6 +14,7 @@
+ 1:minSeqLen	8
+ 1:maxSeqLen	36
+ 1:gcContent	0.3918918918918919
++1:nonATCGFraction	3.896103896103896e-2
+ 2:file	singles.fq
+ 2:encoding	Solexa (64 offset)
+ 2:numSeqs	3
+@@ -20,6 +22,7 @@
+ 2:minSeqLen	8
+ 2:maxSeqLen	36
+ 2:gcContent	0.3918918918918919
++2:nonATCGFraction	3.896103896103896e-2
+ 3:file	preproc.lno4.pairs.1
+ 3:encoding	Solexa (64 offset)
+ 3:numSeqs	2
+@@ -27,6 +30,7 @@
+ 3:minSeqLen	30
+ 3:maxSeqLen	33
+ 3:gcContent	0.38333333333333336
++3:nonATCGFraction	4.7619047619047616e-2
+ 4:file	preproc.lno4.pairs.2
+ 4:encoding	Solexa (64 offset)
+ 4:numSeqs	2
+@@ -34,6 +38,7 @@
+ 4:minSeqLen	30
+ 4:maxSeqLen	33
+ 4:gcContent	0.38333333333333336
++4:nonATCGFraction	4.7619047619047616e-2
+ 5:file	preproc.lno4.singles
+ 5:encoding	Solexa (64 offset)
+ 5:numSeqs	2
+@@ -41,3 +46,4 @@
+ 5:minSeqLen	30
+ 5:maxSeqLen	33
+ 5:gcContent	0.38333333333333336
++5:nonATCGFraction	4.7619047619047616e-2
+diff --git a/tests/preprocess3/preprocess.ngl b/tests/preprocess3/preprocess.ngl
+index 99e3493..36cfde0 100644
+--- a/tests/preprocess3/preprocess.ngl
++++ b/tests/preprocess3/preprocess.ngl
+@@ -1,4 +1,4 @@
+-ngless '0.6'
++ngless '0.8'
+ input = paired('sample.fq', 'sample2.fq', singles='singles.fq')
+ trim = 3
+ input = preprocess(input) using |read|:
+diff --git a/tests/preprocess_fastx_mocat/filter.ngl b/tests/preprocess_fastx_mocat/filter.ngl
+index 7e45bb3..6e37498 100644
+--- a/tests/preprocess_fastx_mocat/filter.ngl
++++ b/tests/preprocess_fastx_mocat/filter.ngl
+@@ -1,4 +1,4 @@
+-ngless "0.0"
++ngless "0.8"
+ 
+ input = paired('input.1.fq.gz', 'input.2.fq.gz')
+ 
+diff --git a/tests/readlines/readlines.ngl b/tests/readlines/readlines.ngl
+index 97ddf8a..6eb5def 100644
+--- a/tests/readlines/readlines.ngl
++++ b/tests/readlines/readlines.ngl
+@@ -1,4 +1,4 @@
+-ngless "0.0"
++ngless "0.8"
+ 
+ input = readlines('input.txt')
+ print(input[0])
+diff --git a/tests/regression-write-fqgz/README.md b/tests/regression-write-fqgz/README.md
+new file mode 100644
+index 0000000..1a869db
+--- /dev/null
++++ b/tests/regression-write-fqgz/README.md
+@@ -0,0 +1,23 @@
++# Issue #59
++
++https://github.com/luispedro/ngless/issues/59
++
++
++Given
++    sample/A.pair.1.fq.gz
++    sample/A.pair.2.fq.gz
++    sample/B.pair.1.fq.gz
++    sample/B.pair.2.fq.gz
++    sample/C.single.fq.gz
++
++and
++
++    ngless "0.7"
++    import "mocat" version "0.0"
++
++    input = load_mocat_sample(sample)
++    write(input, ofile=tmpdir/output.fq)
++
++Produces `output.pair.1.fq`, `output.pair.2.fq`, `output.single.fq` all in the
++original compression instead of following the extension provided.
++
+diff --git a/tests/regression-write-fqgz/expected.pair.1.fq b/tests/regression-write-fqgz/expected.pair.1.fq
+new file mode 100644
+index 0000000..6fc214f
+--- /dev/null
++++ b/tests/regression-write-fqgz/expected.pair.1.fq
+@@ -0,0 +1,24 @@
++@IRIS:7:1:17:394#0/1
++GTCAGGACAAGAAAGACAANTCCAATTNACATT
+++IRIS:7:1:17:394#0/1
++aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
++@IRIS:7:1:17:800#0/1
++GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
+++IRIS:7:1:17:800#0/1
++ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
++@IRIS:7:1:17:1479#0/1
++TGAAAGAT
+++IRIS:7:1:17:1479#0/1
++__a_X]``
++@IRIS:7:1:17:394#0/1
++GTCAGGACAAGAAAGACAANTCCAATTNACATT
+++IRIS:7:1:17:394#0/1
++aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
++@IRIS:7:1:17:800#0/1
++GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
+++IRIS:7:1:17:800#0/1
++ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
++@IRIS:7:1:17:1479#0/1
++TGAAAGAT
+++IRIS:7:1:17:1479#0/1
++__a_X]``
+diff --git a/tests/regression-write-fqgz/expected.pair.2.fq b/tests/regression-write-fqgz/expected.pair.2.fq
+new file mode 100644
+index 0000000..03b63f4
+--- /dev/null
++++ b/tests/regression-write-fqgz/expected.pair.2.fq
+@@ -0,0 +1,24 @@
++@IRIS:7:1:17:394#0/2
++GTCAGGACAAGAAAGACAANTCCAATTNACATT
+++IRIS:7:1:17:394#0/2
++aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
++@IRIS:7:1:17:800#0/2
++GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
+++IRIS:7:1:17:800#0/2
++ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
++@IRIS:7:1:17:1479#0/2
++TGAAAGAT
+++IRIS:7:1:17:1479#0/2
++__a_X]``
++@IRIS:7:1:17:394#0/2
++GTCAGGACAAGAAAGACAANTCCAATTNACATT
+++IRIS:7:1:17:394#0/2
++aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
++@IRIS:7:1:17:800#0/2
++GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
+++IRIS:7:1:17:800#0/2
++ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
++@IRIS:7:1:17:1479#0/2
++TGAAAGAT
+++IRIS:7:1:17:1479#0/2
++__a_X]``
+diff --git a/tests/regression-write-fqgz/expected.singles.fq b/tests/regression-write-fqgz/expected.singles.fq
+new file mode 100644
+index 0000000..48c3a15
+--- /dev/null
++++ b/tests/regression-write-fqgz/expected.singles.fq
+@@ -0,0 +1,24 @@
++@IRIS:7:1:17:394#0
++GTCAGGACAAGAAAGACAANTCCAATTNACATT
+++IRIS:7:1:17:394#0
++aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
++@IRIS:7:1:17:800#0
++GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
+++IRIS:7:1:17:800#0
++ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
++@IRIS:7:1:17:1479#0
++TGAAAGAT
+++IRIS:7:1:17:1479#0
++__a_X]``
++@IRIS:7:1:17:394#0
++GTCAGGACAAGAAAGACAANTCCAATTNACATT
+++IRIS:7:1:17:394#0
++aaabaa`]baaaaa_aab]D^^`b`aYDW]aba
++@IRIS:7:1:17:800#0
++GGAAACACTACTTAGGCTTATAAGATCNGGTTGCGG
+++IRIS:7:1:17:800#0
++ababbaaabaaaaa`]`ba`]`aaaaYD\\_a``XT
++@IRIS:7:1:17:1479#0
++TGAAAGAT
+++IRIS:7:1:17:1479#0
++__a_X]``
+diff --git a/tests/regression-write-fqgz/sample/A.pair.1.fq.gz b/tests/regression-write-fqgz/sample/A.pair.1.fq.gz
+new file mode 120000
+index 0000000..4038bc1
+--- /dev/null
++++ b/tests/regression-write-fqgz/sample/A.pair.1.fq.gz
+@@ -0,0 +1 @@
++../../mocat_sample_gz_paired/sample/sample.pair.1.fq.gz
+\ No newline at end of file
+diff --git a/tests/regression-write-fqgz/sample/A.pair.2.fq.gz b/tests/regression-write-fqgz/sample/A.pair.2.fq.gz
+new file mode 120000
+index 0000000..e21723b
+--- /dev/null
++++ b/tests/regression-write-fqgz/sample/A.pair.2.fq.gz
+@@ -0,0 +1 @@
++../../mocat_sample_gz_paired/sample/sample.pair.2.fq.gz
+\ No newline at end of file
+diff --git a/tests/regression-write-fqgz/sample/A.single.fq.gz b/tests/regression-write-fqgz/sample/A.single.fq.gz
+new file mode 120000
+index 0000000..756a645
+--- /dev/null
++++ b/tests/regression-write-fqgz/sample/A.single.fq.gz
+@@ -0,0 +1 @@
++../../mocat_sample_gz_paired/sample/sample.single.fq.gz
+\ No newline at end of file
+diff --git a/tests/regression-write-fqgz/sample/B.pair.1.fq.gz b/tests/regression-write-fqgz/sample/B.pair.1.fq.gz
+new file mode 120000
+index 0000000..4038bc1
+--- /dev/null
++++ b/tests/regression-write-fqgz/sample/B.pair.1.fq.gz
+@@ -0,0 +1 @@
++../../mocat_sample_gz_paired/sample/sample.pair.1.fq.gz
+\ No newline at end of file
+diff --git a/tests/regression-write-fqgz/sample/B.pair.2.fq.gz b/tests/regression-write-fqgz/sample/B.pair.2.fq.gz
+new file mode 120000
+index 0000000..e21723b
+--- /dev/null
++++ b/tests/regression-write-fqgz/sample/B.pair.2.fq.gz
+@@ -0,0 +1 @@
++../../mocat_sample_gz_paired/sample/sample.pair.2.fq.gz
+\ No newline at end of file
+diff --git a/tests/regression-write-fqgz/sample/B.single.fq.gz b/tests/regression-write-fqgz/sample/B.single.fq.gz
+new file mode 120000
+index 0000000..756a645
+--- /dev/null
++++ b/tests/regression-write-fqgz/sample/B.single.fq.gz
+@@ -0,0 +1 @@
++../../mocat_sample_gz_paired/sample/sample.single.fq.gz
+\ No newline at end of file
+diff --git a/tests/regression-write-fqgz/write-out.ngl b/tests/regression-write-fqgz/write-out.ngl
+new file mode 100644
+index 0000000..d9a0c0b
+--- /dev/null
++++ b/tests/regression-write-fqgz/write-out.ngl
+@@ -0,0 +1,5 @@
++ngless "0.7"
++import "mocat" version "0.0"
++
++input = load_mocat_sample('sample')
++write(input, ofile='output.fq')
+diff --git a/tests/reuse/reuse.ngl b/tests/reuse/reuse.ngl
+index c20ece2..15ba774 100644
+--- a/tests/reuse/reuse.ngl
++++ b/tests/reuse/reuse.ngl
+@@ -1,4 +1,4 @@
+-ngless '0.0'
++ngless '0.8'
+ 
+ MAPPED = {mapped}
+ 
+diff --git a/tests/same-hash-collect-2/expected.counts.txt b/tests/same-hash-collect-2/expected.counts.txt
+index 915139f..635b343 100644
+--- a/tests/same-hash-collect-2/expected.counts.txt
++++ b/tests/same-hash-collect-2/expected.counts.txt
+@@ -1,6 +1,6 @@
+-# Output hash: 458595b9b73025060ba4dc00cdab589e
++# Output hash: 1052fe8887d9b824c0853b335504c49c
+ # Output generated by:
+-#     ngless "0.6"
++#     ngless "0.8"
+ #     import "parallel" version "0.6"
+ #     
+ #     samples = ['basic']
+diff --git a/tests/same-hash-collect-2/hashcollect.ngl b/tests/same-hash-collect-2/hashcollect.ngl
+index fd59452..80318e7 100644
+--- a/tests/same-hash-collect-2/hashcollect.ngl
++++ b/tests/same-hash-collect-2/hashcollect.ngl
+@@ -1,4 +1,4 @@
+-ngless "0.6"
++ngless "0.8"
+ import "parallel" version "0.6"
+ 
+ samples = ['basic']
+diff --git a/tests/same-hash-collect/expected.counts.txt b/tests/same-hash-collect/expected.counts.txt
+index 8334b67..bf541af 100644
+--- a/tests/same-hash-collect/expected.counts.txt
++++ b/tests/same-hash-collect/expected.counts.txt
+@@ -1,6 +1,6 @@
+-# Output hash: 458595b9b73025060ba4dc00cdab589e
++# Output hash: 1052fe8887d9b824c0853b335504c49c
+ # Output generated by:
+-#     ngless "0.6"
++#     ngless "0.8"
+ #     import "parallel" version "0.6"
+ #     
+ #     samples = ['basic']
+diff --git a/tests/same-hash-collect/hashcollect.ngl b/tests/same-hash-collect/hashcollect.ngl
+index 8af5491..ee72b19 100644
+--- a/tests/same-hash-collect/hashcollect.ngl
++++ b/tests/same-hash-collect/hashcollect.ngl
+@@ -1,4 +1,4 @@
+-ngless "0.6"
++ngless "0.8"
+ import "parallel" version "0.6"
+ 
+ samples = ['basic']
+diff --git a/tests/samfile-headers/header.ngl b/tests/samfile-headers/header.ngl
+index 715493b..548ede9 100644
+--- a/tests/samfile-headers/header.ngl
++++ b/tests/samfile-headers/header.ngl
+@@ -1,3 +1,3 @@
+-ngless '0.7'
++ngless '0.8'
+ write(samfile('headerless.sam', headers='headers'), ofile='output.sam')
+ 
+diff --git a/tests/write-hash/expected.hash.txt b/tests/write-hash/expected.hash.txt
+index b2c5aac..6f050dd 100644
+--- a/tests/write-hash/expected.hash.txt
++++ b/tests/write-hash/expected.hash.txt
+@@ -1,5 +1,5 @@
+ # Output generated by:
+-#     ngless '0.6'
++#     ngless '0.8'
+ #     
+ #     counts = count(samfile('seq1_2.sam.bz2'),
+ #                     features=['seqname'],
+@@ -8,7 +8,7 @@
+ #     
+ #     write(counts, ofile='output.hash.txt', auto_comments=[{script}, {hash}])
+ #     
+-# Output hash: 461a3ca623231767eb4b43b3551bb93d
++# Output hash: 07f65e0dbab19789ec66727c655e7101
+ 	seq1_2.sam.bz2
+ -1	1
+ seq1	99990
+diff --git a/tests/write-hash/write.ngl b/tests/write-hash/write.ngl
+index a9e0d11..704967c 100644
+--- a/tests/write-hash/write.ngl
++++ b/tests/write-hash/write.ngl
+@@ -1,4 +1,4 @@
+-ngless '0.6'
++ngless '0.8'
+ 
+ counts = count(samfile('seq1_2.sam.bz2'),
+                 features=['seqname'],
+diff --git a/tests/write-hash2/expected.hash2.txt b/tests/write-hash2/expected.hash2.txt
+index 01101bd..3efe40e 100644
+--- a/tests/write-hash2/expected.hash2.txt
++++ b/tests/write-hash2/expected.hash2.txt
+@@ -1,5 +1,5 @@
+ # Output generated by:
+-#     ngless '0.6'
++#     ngless '0.8'
+ #     
+ #     sf = samfile('seq1_2.sam.bz2')
+ #     recounts = count(sf,
+@@ -9,7 +9,7 @@
+ #     
+ #     write(recounts, ofile='output.hash2.txt', auto_comments=[{script}, {hash}])
+ #     
+-# Output hash: 461a3ca623231767eb4b43b3551bb93d
++# Output hash: 07f65e0dbab19789ec66727c655e7101
+ 	seq1_2.sam.bz2
+ -1	1
+ seq1	99990
+diff --git a/tests/write-hash2/write2.ngl b/tests/write-hash2/write2.ngl
+index bdf8b4b..610ad1b 100644
+--- a/tests/write-hash2/write2.ngl
++++ b/tests/write-hash2/write2.ngl
+@@ -1,4 +1,4 @@
+-ngless '0.6'
++ngless '0.8'
+ 
+ sf = samfile('seq1_2.sam.bz2')
+ recounts = count(sf,
+diff --git a/tests/write_fq/read_write.ngl b/tests/write_fq/read_write.ngl
+index c8c306c..47964cd 100644
+--- a/tests/write_fq/read_write.ngl
++++ b/tests/write_fq/read_write.ngl
+@@ -1,3 +1,3 @@
+-ngless '0.0'
++ngless '0.8'
+ input = fastq('short.fq')
+ write(input, ofile='output.fq')
+diff --git a/tests/write_fq_inline/read_write_inline.ngl b/tests/write_fq_inline/read_write_inline.ngl
+index c29b808..0a4d73e 100644
+--- a/tests/write_fq_inline/read_write_inline.ngl
++++ b/tests/write_fq_inline/read_write_inline.ngl
+@@ -1,2 +1,2 @@
+-ngless '0.0'
++ngless '0.8'
+ write(fastq('short.fq'), ofile='output.fq')
